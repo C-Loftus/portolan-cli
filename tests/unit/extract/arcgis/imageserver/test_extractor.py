@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from portolan_cli.extract.arcgis.imageserver.discovery import ImageServerMetadata
@@ -655,3 +656,296 @@ class TestAutoInitCatalogExistingCatalog:
         _auto_init_catalog(tmp_path, service_name="svc", catalog_id="phl-housing")
 
         assert "Ignored --id 'phl-housing'" in capsys.readouterr().err
+
+
+# =============================================================================
+# HTTP error messages (issue #870)
+# =============================================================================
+
+
+def _mock_client_with_status(status_code: int, content: bytes) -> AsyncMock:
+    """Build an httpx client mock whose GET fails raise_for_status with a body."""
+    request = httpx.Request("GET", "https://example.com/ImageServer/exportImage")
+    response = httpx.Response(status_code, content=content, request=request)
+    mock_response = AsyncMock()
+    mock_response.status_code = status_code
+    mock_response.content = content
+    mock_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("server error", request=request, response=response)
+    )
+    client = AsyncMock()
+    client.get.return_value = mock_response
+    return client
+
+
+@pytest.mark.unit
+class TestHttpErrorMessages:
+    """A failed exportImage request reports the reason and the request URL.
+
+    Issue #870 reports NAIP tiles that fail with "HTTP 500" and nothing else.
+    The error must carry the ArcGIS message and details when the body has
+    them, the body text when it is not JSON, and the exportImage URL in every
+    case so the user can reproduce the request.
+    """
+
+    EXPORT_URL = (
+        "https://example.com/ImageServer/exportImage"
+        "?bbox=0.0%2C0.0%2C4096.0%2C4096.0&size=4096%2C4096&format=tiff&f=image"
+    )
+
+    @pytest.mark.asyncio
+    async def test_http_500_json_error_reports_message_details_and_url(
+        self, sample_tile: TileSpec, tmp_path: Path
+    ) -> None:
+        body = (
+            b'{"error":{"code":500,"message":"Unable to complete operation.",'
+            b'"details":["Image export failed.","Timeout reading raster."]}}'
+        )
+        client = _mock_client_with_status(500, body)
+
+        with pytest.raises(ImageServerExtractionError) as exc_info:
+            await download_tile(
+                "https://example.com/ImageServer", sample_tile, tmp_path / "out.tif", client
+            )
+
+        assert str(exc_info.value) == (
+            "ArcGIS error for tile tile_0_0: HTTP 500 [500] Unable to complete operation. "
+            "Details: Image export failed.; Timeout reading raster. "
+            f"Request: {self.EXPORT_URL}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_http_500_text_body_is_quoted(
+        self, sample_tile: TileSpec, tmp_path: Path
+    ) -> None:
+        client = _mock_client_with_status(500, b"  Internal Server Error\n")
+
+        with pytest.raises(ImageServerExtractionError) as exc_info:
+            await download_tile(
+                "https://example.com/ImageServer", sample_tile, tmp_path / "out.tif", client
+            )
+
+        assert str(exc_info.value) == (
+            "Tile download failed (tile_0_0): HTTP 500. Response: Internal Server Error. "
+            f"Request: {self.EXPORT_URL}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_http_500_empty_body_names_request_url(
+        self, sample_tile: TileSpec, tmp_path: Path
+    ) -> None:
+        client = _mock_client_with_status(500, b"")
+
+        with pytest.raises(ImageServerExtractionError) as exc_info:
+            await download_tile(
+                "https://example.com/ImageServer", sample_tile, tmp_path / "out.tif", client
+            )
+
+        assert str(exc_info.value) == (
+            "Tile download failed (tile_0_0): HTTP 500 (empty response body). "
+            f"Request: {self.EXPORT_URL}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_http_500_html_body_is_truncated(
+        self, sample_tile: TileSpec, tmp_path: Path
+    ) -> None:
+        client = _mock_client_with_status(500, b"<html>" + b"x" * 500 + b"</html>")
+
+        with pytest.raises(ImageServerExtractionError) as exc_info:
+            await download_tile(
+                "https://example.com/ImageServer", sample_tile, tmp_path / "out.tif", client
+            )
+
+        message = str(exc_info.value)
+        assert message.startswith("Tile download failed (tile_0_0): HTTP 500. Response: <html>")
+        assert message.endswith(f"Request: {self.EXPORT_URL}")
+        assert "</html>" not in message
+
+    @pytest.mark.asyncio
+    async def test_http_200_json_error_reports_details_and_url(
+        self, sample_tile: TileSpec, tmp_path: Path
+    ) -> None:
+        body = (
+            b'{"error":{"code":400,"message":"The requested image exceeds the size limit.",'
+            b'"details":[]}}'
+        )
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.content = body
+        mock_response.raise_for_status = MagicMock()
+        client = AsyncMock()
+        client.get.return_value = mock_response
+
+        with pytest.raises(ImageServerExtractionError) as exc_info:
+            await download_tile(
+                "https://example.com/ImageServer", sample_tile, tmp_path / "out.tif", client
+            )
+
+        assert str(exc_info.value) == (
+            "ArcGIS error for tile tile_0_0: HTTP 200 [400] "
+            "The requested image exceeds the size limit. "
+            f"Request: {self.EXPORT_URL}"
+        )
+
+
+@pytest.mark.unit
+class TestFailedTileOutput:
+    """The per-tile failure line shows the reason (issue #870)."""
+
+    def test_failed_tile_line_includes_reason(
+        self, tmp_path: Path, sample_tile: TileSpec, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from datetime import datetime, timezone
+
+        from portolan_cli.extract.arcgis.imageserver.extractor import (
+            _ProcessingStats,
+            _update_stats_and_state,
+        )
+        from portolan_cli.extract.arcgis.imageserver.resume import ImageServerResumeState
+
+        stats = _ProcessingStats()
+        state = ImageServerResumeState(
+            succeeded_tiles=set(),
+            failed_tiles=set(),
+            service_url="https://example.com/ImageServer",
+            started_at=datetime.now(timezone.utc),
+        )
+
+        _update_stats_and_state(
+            tile=sample_tile,
+            succeeded=False,
+            bytes_downloaded=0,
+            stats=stats,
+            resume_state=state,
+            index=0,
+            total=1,
+            output_dir=tmp_path,
+            duration=1.0,
+            error_msg="Tile download failed (tile_0_0): HTTP 500 (empty response body)",
+            attempts=3,
+        )
+
+        captured = capsys.readouterr()
+        assert (
+            "Tile tile_0_0: failed [1/1]: "
+            "Tile download failed (tile_0_0): HTTP 500 (empty response body)"
+        ) in captured.err
+        assert stats.tiles_failed == 1
+        assert stats.tile_results[0].error == (
+            "Tile download failed (tile_0_0): HTTP 500 (empty response body)"
+        )
+
+
+# =============================================================================
+# License resolution on the raster path (issue #870)
+# =============================================================================
+
+
+@pytest.mark.unit
+class TestLicenseResolution:
+    """The raster path honors --license and stops early without one.
+
+    Issue #870 runs `extract arcgis <ImageServer> --license CC-BY-4.0`. Before
+    the fix the raster path dropped the flag, seeded a TODO placeholder, and
+    the add license gate (issue #686) aborted after every tile had downloaded.
+    """
+
+    def _run(
+        self,
+        tmp_path: Path,
+        metadata: ImageServerMetadata,
+        *,
+        license_id: str | None = None,
+        license_url: str | None = None,
+    ) -> tuple[AsyncMock, Path]:
+        """Run extract_imageserver with discovery, download, and init mocked."""
+        from portolan_cli.extract.arcgis.imageserver.extractor import _ProcessingStats
+
+        stats = _ProcessingStats()
+        mock_tiles = AsyncMock(return_value=stats)
+        with (
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor.discover_imageserver",
+                new_callable=AsyncMock,
+                return_value=metadata,
+            ),
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor._extract_all_tiles",
+                mock_tiles,
+            ),
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor._auto_init_catalog",
+                return_value=True,
+            ),
+        ):
+            import asyncio
+
+            asyncio.run(
+                extract_imageserver(
+                    "https://example.com/ImageServer",
+                    tmp_path,
+                    config=ExtractionConfig(raw=False),
+                    license_id=license_id,
+                    license_url=license_url,
+                )
+            )
+        return mock_tiles, tmp_path / ".portolan" / "metadata.yaml"
+
+    def test_license_flag_seeds_metadata_yaml(
+        self, tmp_path: Path, small_extent_metadata: ImageServerMetadata
+    ) -> None:
+        import yaml
+
+        mock_tiles, metadata_path = self._run(
+            tmp_path, small_extent_metadata, license_id="CC-BY-4.0"
+        )
+
+        assert mock_tiles.await_count == 1
+        seeded = yaml.safe_load(metadata_path.read_text())
+        assert seeded["license"] == "CC-BY-4.0"
+        assert "license_url" not in seeded
+
+    def test_license_flag_with_url_seeds_both(
+        self, tmp_path: Path, small_extent_metadata: ImageServerMetadata
+    ) -> None:
+        import yaml
+
+        _, metadata_path = self._run(
+            tmp_path,
+            small_extent_metadata,
+            license_id="other",
+            license_url="https://example.com/terms.html",
+        )
+
+        seeded = yaml.safe_load(metadata_path.read_text())
+        assert seeded["license"] == "other"
+        assert seeded["license_url"] == "https://example.com/terms.html"
+
+    def test_harvested_license_url_seeds_other(
+        self, tmp_path: Path, small_extent_metadata: ImageServerMetadata
+    ) -> None:
+        import yaml
+
+        small_extent_metadata.license_info = (
+            "Data licensed under https://creativecommons.org/licenses/by/4.0/"
+        )
+
+        _, metadata_path = self._run(tmp_path, small_extent_metadata)
+
+        seeded = yaml.safe_load(metadata_path.read_text())
+        assert seeded["license"] == "other"
+        assert seeded["license_url"] == "https://creativecommons.org/licenses/by/4.0/"
+
+    def test_missing_license_stops_before_download(
+        self, tmp_path: Path, small_extent_metadata: ImageServerMetadata
+    ) -> None:
+        from portolan_cli.errors import MissingLicenseError
+
+        assert small_extent_metadata.license_info is None
+
+        with pytest.raises(MissingLicenseError, match="publishes no license URL"):
+            self._run(tmp_path, small_extent_metadata)
+
+        assert not (tmp_path / "tiles").exists() or not any((tmp_path / "tiles").iterdir())
+        assert not (tmp_path / ".portolan" / "imageserver-resume.json").exists()

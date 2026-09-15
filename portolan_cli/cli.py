@@ -6293,6 +6293,8 @@ def _handle_imageserver_extraction(
     json_output: bool,
     auto: bool,
     collection_name: str | None,
+    license_id: str | None = None,
+    license_url: str | None = None,
 ) -> None:
     """Handle ImageServer URL extraction (raster data)."""
     from portolan_cli.conversion_config import CogSettings, get_cog_settings
@@ -6353,6 +6355,7 @@ def _handle_imageserver_extraction(
         catalog_id=catalog_id,
         tile_size=tile_size,
         max_concurrent=max_concurrent,
+        max_retries=retries,
         dry_run=dry_run,
         resume=resume,
         raw=False,  # ImageServer always creates STAC structure
@@ -6362,6 +6365,8 @@ def _handle_imageserver_extraction(
         compression=cog_settings.compression,
         use_json=json_output,
         collection_name=collection_name,
+        license=license_id,
+        license_url=license_url,
     )
 
     # Run extraction
@@ -6721,7 +6726,7 @@ def extract() -> None:
     "--retries",
     type=click.IntRange(min=1),
     default=3,
-    help="Retry attempts per failed layer (default: 3).",
+    help="Retry attempts per failed layer or tile (default: 3).",
 )
 @click.option(
     "--timeout",
@@ -6988,6 +6993,8 @@ def extract_arcgis_cmd(
             json_output=use_json,
             auto=auto,
             collection_name=collection_name,
+            license_id=license_id,
+            license_url=license_url,
         )
         return
 

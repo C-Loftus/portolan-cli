@@ -674,3 +674,113 @@ class TestDiscoverImageserverEdgeCases:
 
             assert result.pixel_size_x == pytest.approx(0.00027777777778)
             assert result.pixel_type == "F64"
+
+
+# =============================================================================
+# Optional image size limits (issue #870)
+# =============================================================================
+
+
+class TestOptionalImageSizeLimits:
+    """Hosted tiled imagery layers omit maxImageHeight and maxImageWidth.
+
+    Issue #870 reports a tiled imagery layer on ArcGIS Online that fails
+    discovery with "Missing required field 'maxImageHeight'". The fields are
+    optional. When a service omits them, discovery applies the ArcGIS Server
+    defaults instead of refusing the service.
+    """
+
+    def _without_limits(self, response: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in response.items()
+            if key not in ("maxImageHeight", "maxImageWidth")
+        }
+
+    def test_parse_applies_defaults_when_limits_missing(
+        self, imageserver_response: dict[str, Any]
+    ) -> None:
+        from portolan_cli.extract.arcgis.imageserver.discovery import (
+            DEFAULT_MAX_IMAGE_HEIGHT,
+            DEFAULT_MAX_IMAGE_WIDTH,
+            parse_imageserver_response,
+        )
+
+        metadata = parse_imageserver_response(self._without_limits(imageserver_response))
+
+        assert DEFAULT_MAX_IMAGE_WIDTH == 15000
+        assert DEFAULT_MAX_IMAGE_HEIGHT == 4100
+        assert metadata.max_image_width == 15000
+        assert metadata.max_image_height == 4100
+
+    def test_parse_keeps_explicit_limits(self, imageserver_response: dict[str, Any]) -> None:
+        from portolan_cli.extract.arcgis.imageserver.discovery import (
+            parse_imageserver_response,
+        )
+
+        metadata = parse_imageserver_response(imageserver_response)
+
+        assert metadata.max_image_width == 4096
+        assert metadata.max_image_height == 4096
+
+    def test_parse_applies_default_for_one_missing_limit(
+        self, imageserver_response: dict[str, Any]
+    ) -> None:
+        from portolan_cli.extract.arcgis.imageserver.discovery import (
+            parse_imageserver_response,
+        )
+
+        data = dict(imageserver_response)
+        del data["maxImageHeight"]
+
+        metadata = parse_imageserver_response(data)
+
+        assert metadata.max_image_width == 4096
+        assert metadata.max_image_height == 4100
+
+    def test_parse_logs_warning_when_defaults_apply(
+        self, imageserver_response: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from portolan_cli.extract.arcgis.imageserver.discovery import (
+            parse_imageserver_response,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="portolan_cli.extract.arcgis.imageserver"):
+            parse_imageserver_response(self._without_limits(imageserver_response))
+
+        assert "maxImageWidth" in caplog.text
+        assert "maxImageHeight" in caplog.text
+        assert "15000" in caplog.text
+        assert "4100" in caplog.text
+
+    def test_parse_still_rejects_missing_band_count(
+        self, imageserver_response: dict[str, Any]
+    ) -> None:
+        from portolan_cli.extract.arcgis.imageserver.discovery import (
+            parse_imageserver_response,
+        )
+
+        data = self._without_limits(imageserver_response)
+        del data["bandCount"]
+
+        with pytest.raises(ImageServerDiscoveryError, match="Missing required field 'bandCount'"):
+            parse_imageserver_response(data)
+
+    @pytest.mark.asyncio
+    async def test_discover_applies_defaults_when_limits_missing(
+        self, imageserver_response: dict[str, Any]
+    ) -> None:
+        with patch(
+            "portolan_cli.extract.arcgis.imageserver.discovery.httpx.AsyncClient"
+        ) as mock_client_class:
+            _setup_async_client_mock(
+                mock_client_class,
+                _mock_httpx_response(self._without_limits(imageserver_response)),
+            )
+
+            metadata = await discover_imageserver("https://services.arcgis.com/test/ImageServer")
+
+        assert metadata.max_image_width == 15000
+        assert metadata.max_image_height == 4100

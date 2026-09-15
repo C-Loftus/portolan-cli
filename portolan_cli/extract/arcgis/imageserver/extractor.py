@@ -57,6 +57,11 @@ from portolan_cli.extract.arcgis.imageserver.resume import (
 )
 from portolan_cli.extract.arcgis.imageserver.tiling import TileSpec, compute_tile_grid
 from portolan_cli.json_io import write_json_atomic
+from portolan_cli.licensing import (
+    ResolvedLicense,
+    license_url_from_text,
+    resolve_harvest_license,
+)
 from portolan_cli.metadata_seeding import seed_metadata_yaml
 from portolan_cli.output import detail, error, info, success, warn
 
@@ -235,6 +240,135 @@ def _build_export_url(
     return f"{base_url}/exportImage?{urlencode(params)}"
 
 
+# Longest response body excerpt that a tile error message quotes.
+_ERROR_BODY_EXCERPT_CHARS = 200
+
+
+def _describe_arcgis_error(
+    tile: TileSpec,
+    status_code: int,
+    content: bytes,
+    export_url: str,
+) -> str | None:
+    """Describe an ArcGIS JSON error body, or return None if it is not one.
+
+    ArcGIS returns errors as ``{"error": {"code", "message", "details"}}``.
+    The server sends this body with HTTP 200 for request errors and with
+    HTTP 4xx/5xx for server errors. The details list often carries the real
+    reason (issue #870), so the message includes it.
+
+    Args:
+        tile: Tile whose request failed.
+        status_code: HTTP status of the response.
+        content: Raw response body.
+        export_url: Full exportImage URL that was requested.
+
+    Returns:
+        Error message, or None when the body is not an ArcGIS error.
+    """
+    if not content.lstrip().startswith(b"{"):
+        return None
+    try:
+        error_data = json.loads(content.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(error_data, dict) or "error" not in error_data:
+        return None
+
+    arcgis_error = error_data["error"]
+    if not isinstance(arcgis_error, dict):
+        arcgis_error = {"message": str(arcgis_error)}
+    code = arcgis_error.get("code", status_code)
+    message = str(arcgis_error.get("message", "Unknown error")).rstrip(".")
+    details_raw = arcgis_error.get("details") or []
+    if isinstance(details_raw, str):
+        details_raw = [details_raw]
+    details = [str(d).strip() for d in details_raw if str(d).strip()]
+
+    msg = f"ArcGIS error for tile {tile.get_id()}: HTTP {status_code} [{code}] {message}."
+    if details:
+        msg += f" Details: {'; '.join(details)}"
+        if not msg.endswith("."):
+            msg += "."
+    return f"{msg} Request: {export_url}"
+
+
+def _describe_http_error(
+    tile: TileSpec,
+    status_code: int,
+    content: bytes,
+    export_url: str,
+) -> str:
+    """Build the error message for a non-2xx exportImage response.
+
+    Prefers the ArcGIS JSON error when the body has one. Otherwise quotes an
+    excerpt of the body, or says the body was empty. Every message ends with
+    the request URL so the user can reproduce the failure (issue #870).
+
+    Args:
+        tile: Tile whose request failed.
+        status_code: HTTP status of the response.
+        content: Raw response body.
+        export_url: Full exportImage URL that was requested.
+
+    Returns:
+        Error message.
+    """
+    arcgis_msg = _describe_arcgis_error(tile, status_code, content, export_url)
+    if arcgis_msg is not None:
+        return arcgis_msg
+
+    excerpt = content[:_ERROR_BODY_EXCERPT_CHARS].decode("utf-8", errors="replace").strip()
+    excerpt = " ".join(excerpt.split())
+    if not excerpt:
+        return (
+            f"Tile download failed ({tile.get_id()}): HTTP {status_code} "
+            f"(empty response body). Request: {export_url}"
+        )
+    return (
+        f"Tile download failed ({tile.get_id()}): HTTP {status_code}. "
+        f"Response: {excerpt}. Request: {export_url}"
+    )
+
+
+def _describe_non_tiff_body(
+    tile: TileSpec,
+    status_code: int,
+    content: bytes,
+    export_url: str,
+) -> str:
+    """Build the error message for a 2xx response that is not a TIFF.
+
+    Args:
+        tile: Tile whose request failed.
+        status_code: HTTP status of the response.
+        content: Raw response body.
+        export_url: Full exportImage URL that was requested.
+
+    Returns:
+        Error message.
+    """
+    # HTML error page
+    if content.startswith(b"<!") or content.startswith(b"<html"):
+        return (
+            f"Server returned HTML instead of TIFF for tile {tile.get_id()}. Request: {export_url}"
+        )
+    # ArcGIS JSON error, sent with HTTP 200 for request errors
+    arcgis_msg = _describe_arcgis_error(tile, status_code, content, export_url)
+    if arcgis_msg is not None:
+        return arcgis_msg
+    # Other JSON
+    if content.startswith(b"{"):
+        try:
+            json.loads(content.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        else:
+            excerpt = content[:_ERROR_BODY_EXCERPT_CHARS].decode("utf-8", errors="replace")
+            return f"Unexpected JSON response for tile {tile.get_id()}: {excerpt}"
+    return f"Invalid TIFF data for tile {tile.get_id()} (bad magic bytes)"
+
+
 async def download_tile(
     url: str,
     tile: TileSpec,
@@ -275,25 +409,9 @@ async def download_tile(
         # Validate that response is actually a TIFF
         content = response.content
         if not _validate_tiff(content):
-            # Check if it's an HTML error page
-            if content.startswith(b"<!") or content.startswith(b"<html"):
-                msg = f"Server returned HTML instead of TIFF for tile {tile.get_id()}"
-            # Check if it's a JSON error response from ArcGIS
-            elif content.startswith(b"{"):
-                try:
-                    error_data = json.loads(content.decode("utf-8"))
-                    if "error" in error_data:
-                        arcgis_error = error_data["error"]
-                        code = arcgis_error.get("code", "unknown")
-                        message = arcgis_error.get("message", "Unknown error")
-                        msg = f"ArcGIS error for tile {tile.get_id()}: [{code}] {message}"
-                    else:
-                        msg = f"Unexpected JSON response for tile {tile.get_id()}: {content[:200].decode('utf-8', errors='replace')}"
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    msg = f"Invalid TIFF data for tile {tile.get_id()} (bad magic bytes)"
-            else:
-                msg = f"Invalid TIFF data for tile {tile.get_id()} (bad magic bytes)"
-            raise ImageServerExtractionError(msg)
+            raise ImageServerExtractionError(
+                _describe_non_tiff_body(tile, response.status_code, content, export_url)
+            )
 
         # Ensure parent directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,26 +421,13 @@ async def download_tile(
         return len(content)
 
     except httpx.HTTPStatusError as e:
-        # Try to extract ArcGIS JSON error details from 4xx/5xx responses
-        content = e.response.content
-        if content.startswith(b"{"):
-            try:
-                error_data = json.loads(content.decode("utf-8"))
-                if "error" in error_data:
-                    arcgis_error = error_data["error"]
-                    code = arcgis_error.get("code", e.response.status_code)
-                    message = arcgis_error.get("message", "Unknown error")
-                    msg = f"ArcGIS error for tile {tile.get_id()}: [{code}] {message}"
-                    raise ImageServerExtractionError(msg) from e
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass  # Fall through to generic error
-        msg = f"Tile download failed ({tile.get_id()}): HTTP {e.response.status_code}"
+        msg = _describe_http_error(tile, e.response.status_code, e.response.content, export_url)
         raise ImageServerExtractionError(msg) from e
     except httpx.TimeoutException as e:
-        msg = f"Tile download timeout ({tile.get_id()})"
+        msg = f"Tile download timeout ({tile.get_id()}). Request: {export_url}"
         raise ImageServerExtractionError(msg) from e
     except httpx.RequestError as e:
-        msg = f"Tile download failed ({tile.get_id()}): {e}"
+        msg = f"Tile download failed ({tile.get_id()}): {e}. Request: {export_url}"
         raise ImageServerExtractionError(msg) from e
     except OSError as e:
         msg = f"Failed to write tile ({tile.get_id()}): {e}"
@@ -802,6 +907,7 @@ def _load_effective_config(config: ExtractionConfig, output_dir: Path) -> Extrac
 def _seed_metadata_from_report(
     output_dir: Path,
     report: ImageServerExtractionReport,
+    resolved_license: ResolvedLicense | None = None,
 ) -> None:
     """Seed metadata.yaml from extraction report.
 
@@ -811,11 +917,13 @@ def _seed_metadata_from_report(
     Args:
         output_dir: Output directory containing .portolan/.
         report: Extraction report with metadata_extracted.
+        resolved_license: License resolved before the download, which wins over
+            anything the harvest found (issue #686). None in raw mode.
     """
     extracted = report.metadata_extracted.to_extracted()
 
     metadata_path = output_dir / ".portolan" / "metadata.yaml"
-    if seed_metadata_yaml(extracted, metadata_path):
+    if seed_metadata_yaml(extracted, metadata_path, license_override=resolved_license):
         info(f"Seeded metadata.yaml from {extracted.source_type}")
 
 
@@ -857,7 +965,8 @@ def _auto_init_catalog(
     # catalog already carries a license, so the add license gate (issue #686) passes.
     if detect_state(output_dir) is not CatalogState.MANAGED:
         # Initialize the catalog. license_id=None because the ImageServer path seeds
-        # metadata.yaml from the harvested service licenseInfo (issue #686).
+        # metadata.yaml from --license or the harvested service licenseInfo before
+        # this runs (issue #686, issue #870).
         # Print what init_catalog had to guess, the way `init` does, so a derived
         # id that names a tooling artifact does not reach a published catalog
         # unflagged (issue #821).
@@ -1040,7 +1149,10 @@ def _update_stats_and_state(
             )
         )
 
-        error(f"Tile {tile_id}: failed [{index + 1}/{total}]")
+        failure_line = f"Tile {tile_id}: failed [{index + 1}/{total}]"
+        if error_msg:
+            failure_line += f": {error_msg}"
+        error(failure_line)
 
         if on_progress:
             on_progress(
@@ -1096,6 +1208,8 @@ async def extract_imageserver(
     on_progress: Callable[[TileProgress], None] | None = None,
     collection_name: str | None = None,
     bbox_crs: str | None = None,
+    license_id: str | None = None,
+    license_url: str | None = None,
 ) -> ExtractionResult:
     """Extract raster tiles from ImageServer to COG files.
 
@@ -1112,12 +1226,18 @@ async def extract_imageserver(
         collection_name: Name for the collection directory (default: 'tiles').
         bbox_crs: Optional explicit CRS of the bbox (e.g., "EPSG:4326", "EPSG:3857").
             If provided, skips auto-detection and uses this CRS for reprojection.
+        license_id: SPDX identifier from --license, or "other" with license_url.
+            Overrides any license URL in the service's licenseInfo (issue #686).
+        license_url: URL of the license text from --license-url.
 
     Returns:
         ExtractionResult with extraction statistics and full report.
 
     Raises:
         ImageServerDiscoveryError: If service discovery fails.
+        MissingLicenseError: If neither the flags nor the service licenseInfo
+            yield a license, unless config.raw is True. Raised before any tile
+            downloads, so the failure costs a re-run rather than a download.
         ValueError: If collection_name contains path traversal sequences.
     """
     if config is None:
@@ -1182,6 +1302,19 @@ async def extract_imageserver(
         info(f"[DRY RUN] Would extract {len(tiles)} tiles")
         return _create_empty_result(output_dir)
 
+    # Resolve the license before downloading anything, so a harvest that cannot be
+    # licensed costs one command re-run rather than a whole download (issue #686).
+    # Raw mode writes no catalog, so it has nothing to license.
+    resolved_license = (
+        None
+        if config.raw
+        else resolve_harvest_license(
+            cli_license=license_id,
+            cli_license_url=license_url,
+            harvested_license_url=license_url_from_text(metadata.license_info),
+        )
+    )
+
     # Resume state
     resume_path = portolan_dir / "imageserver-resume.json"
     resume_state = _load_or_create_resume_state(resume, resume_path, url)
@@ -1235,7 +1368,7 @@ async def extract_imageserver(
     save_imageserver_report(report, report_path)
 
     # Seed metadata.yaml from extracted service metadata
-    _seed_metadata_from_report(output_dir, report)
+    _seed_metadata_from_report(output_dir, report, resolved_license)
 
     success(f"Extracted {stats.tiles_downloaded} tiles ({stats.total_bytes:,} bytes)")
     if stats.tiles_failed > 0:

@@ -36,7 +36,7 @@ from portolan_cli.extract.arcgis.imageserver.extractor import (
     TileProgress,
     extract_imageserver,
 )
-from portolan_cli.output import detail, error, info, success
+from portolan_cli.output import detail, error, info, success, warn
 
 if TYPE_CHECKING:
     from portolan_cli.extract.arcgis.imageserver.report import ImageServerExtractionReport
@@ -49,6 +49,7 @@ class ImageServerCLIOptions:
     Attributes:
         tile_size: Desired tile size in pixels (default 4096).
         max_concurrent: Maximum concurrent tile downloads (default 4).
+        max_retries: Attempts per tile before it counts as failed (default 3).
         dry_run: If True, compute tiles but don't download.
         resume: If True, resume from previous extraction.
         raw: If True, skip auto-init (only create COGs + report, no STAC catalog).
@@ -60,10 +61,14 @@ class ImageServerCLIOptions:
         collection_name: Optional name for the collection (default: 'tiles').
         catalog_id: Catalog id for the created catalog. None derives it from
             the output directory name, which is the behavior before issue #821.
+        license: SPDX identifier from --license, or "other" with license_url.
+            Overrides any license URL in the service's licenseInfo (issue #686).
+        license_url: URL of the license text from --license-url.
     """
 
     tile_size: int = 4096
     max_concurrent: int = 4
+    max_retries: int = 3
     dry_run: bool = False
     resume: bool = False
     raw: bool = False
@@ -74,6 +79,8 @@ class ImageServerCLIOptions:
     use_json: bool = False
     collection_name: str | None = None
     catalog_id: str | None = None
+    license: str | None = None
+    license_url: str | None = None
 
 
 def _create_progress_callback(
@@ -115,6 +122,23 @@ def _create_progress_callback(
     return status_tracker, on_progress
 
 
+def _print_failure_hint(tiles_failed: int) -> None:
+    """Tell the user how to recover from failed tiles (issue #870).
+
+    Failed tiles stay in the resume state, so a second run with --resume
+    retries them alone. HTTP 5xx responses from exportImage usually mean the
+    server could not build a tile of the requested size under load, so a
+    smaller tile or fewer parallel requests is the next thing to try.
+
+    Args:
+        tiles_failed: Number of tiles that failed after all retries.
+    """
+    warn(
+        f"Re-run the same command with --resume to retry the {tiles_failed} failed tiles. "
+        "If the server returned HTTP 5xx, lower --tile-size or --max-concurrent."
+    )
+
+
 async def run_imageserver_extraction(
     url: str,
     output_dir: Path,
@@ -145,6 +169,7 @@ async def run_imageserver_extraction(
         catalog_id=options.catalog_id,
         tile_size=options.tile_size,
         max_concurrent=options.max_concurrent,
+        max_retries=options.max_retries,
         dry_run=options.dry_run,
         raw=options.raw,
         timeout=options.timeout,
@@ -164,6 +189,8 @@ async def run_imageserver_extraction(
             on_progress=on_progress,
             collection_name=options.collection_name,
             bbox_crs=options.bbox_crs,
+            license_id=options.license,
+            license_url=options.license_url,
         )
 
         # Determine exit code based on results
@@ -173,6 +200,7 @@ async def run_imageserver_extraction(
         if result.tiles_downloaded == 0 and result.tiles_failed > 0:
             # Complete failure - all tiles failed
             error(f"Extraction failed: all {result.tiles_failed} tiles failed")
+            _print_failure_hint(result.tiles_failed)
             return 1, result.report
 
         # Success or partial success
@@ -181,6 +209,7 @@ async def run_imageserver_extraction(
                 f"Extraction completed with warnings: "
                 f"{result.tiles_downloaded} succeeded, {result.tiles_failed} failed"
             )
+            _print_failure_hint(result.tiles_failed)
         else:
             success(
                 f"Extraction complete: {result.tiles_downloaded} tiles "
