@@ -64,6 +64,9 @@ class ImageServerCLIOptions:
         license: SPDX identifier from --license, or "other" with license_url.
             Overrides any license URL in the service's licenseInfo (issue #686).
         license_url: URL of the license text from --license-url.
+        coarse_scan: Ask a coarse tile cache level which blocks hold data
+            before reading them (issue #870). Only a cache-only service uses
+            it.
     """
 
     tile_size: int = 4096
@@ -81,6 +84,7 @@ class ImageServerCLIOptions:
     catalog_id: str | None = None
     license: str | None = None
     license_url: str | None = None
+    coarse_scan: bool = True
 
 
 def _create_progress_callback(
@@ -170,6 +174,7 @@ async def run_imageserver_extraction(
         tile_size=options.tile_size,
         max_concurrent=options.max_concurrent,
         max_retries=options.max_retries,
+        coarse_scan=options.coarse_scan,
         dry_run=options.dry_run,
         raw=options.raw,
         timeout=options.timeout,
@@ -201,6 +206,15 @@ async def run_imageserver_extraction(
             # Complete failure - all tiles failed
             error(f"Extraction failed: all {result.tiles_failed} tiles failed")
             _print_failure_hint(result.tiles_failed)
+            return 1, result.report
+
+        if result.tiles_downloaded == 0 and result.tiles_empty > 0:
+            # The service answered every request, and every tile holds no data.
+            error(
+                f"Extraction produced no data: all {result.tiles_empty} tiles are empty. "
+                "The service extent covers more area than its data does. "
+                "Use --bbox to name the area you want."
+            )
             return 1, result.report
 
         # Success or partial success

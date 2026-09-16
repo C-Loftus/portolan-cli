@@ -6282,6 +6282,7 @@ def _handle_imageserver_extraction(
     output_dir: Path,
     catalog_id: str | None,
     tile_size: int,
+    coarse_scan: bool,
     bbox: str | None,
     bbox_crs: str | None,
     compression: str | None,
@@ -6354,6 +6355,7 @@ def _handle_imageserver_extraction(
     options = ImageServerCLIOptions(
         catalog_id=catalog_id,
         tile_size=tile_size,
+        coarse_scan=coarse_scan,
         max_concurrent=max_concurrent,
         max_retries=retries,
         dry_run=dry_run,
@@ -6768,6 +6770,15 @@ def extract() -> None:
     help="[ImageServer] Tile size in pixels (default: 4096).",
 )
 @click.option(
+    "--coarse-scan/--no-coarse-scan",
+    default=True,
+    help=(
+        "[ImageServer] For a cache-only service, ask a coarse cache level which "
+        "blocks hold data before reading them (default: on). It makes a sparse "
+        "service much faster. Turn it off to read every cache tile."
+    ),
+)
+@click.option(
     "--bbox",
     type=str,
     default=None,
@@ -6846,6 +6857,7 @@ def extract_arcgis_cmd(
     auto: bool,
     raw: bool,
     tile_size: int,
+    coarse_scan: bool,
     bbox: str | None,
     bbox_crs: str | None,
     compression: str | None,
@@ -6982,6 +6994,7 @@ def extract_arcgis_cmd(
             output_dir=output_dir,
             catalog_id=catalog_id,
             tile_size=tile_size,
+            coarse_scan=coarse_scan,
             bbox=bbox,
             bbox_crs=bbox_crs,
             compression=compression,

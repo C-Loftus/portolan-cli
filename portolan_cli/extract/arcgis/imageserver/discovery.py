@@ -23,6 +23,12 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
+from portolan_cli.extract.arcgis.imageserver.tilecache import (
+    TileCacheInfo,
+    export_image_supported,
+    parse_tile_info,
+)
+
 logger = logging.getLogger(__name__)
 
 # ArcGIS Server defaults for the "Max Image Height" and "Max Image Width"
@@ -80,6 +86,9 @@ class ImageServerMetadata:
         keywords: Keywords from documentInfo (comma-separated list)
         license_info: License text from licenseInfo
         access_information: Access restrictions from accessInformation (known_issues)
+        tile_cache: Tile cache grid from tileInfo, or None when the service
+            publishes no cache. A hosted tiled imagery layer serves only this
+            cache (issue #870).
     """
 
     name: str
@@ -100,6 +109,20 @@ class ImageServerMetadata:
     keywords: list[str] | None = None
     license_info: str | None = None
     access_information: str | None = None
+    tile_cache: TileCacheInfo | None = None
+
+    @property
+    def export_image_supported(self) -> bool:
+        """Report whether the service accepts exportImage requests.
+
+        A service that lists the TilesOnly capability answers exportImage with
+        HTTP 400 at every size. The extractor reads its cache instead
+        (issue #870).
+
+        Returns:
+            False when the service is cache-only, True otherwise.
+        """
+        return export_image_supported(self.capabilities)
 
     def get_crs_string(self) -> str:
         """Get CRS as EPSG string from spatial reference.
@@ -364,6 +387,7 @@ def parse_imageserver_response(data: dict[str, Any]) -> ImageServerMetadata:
         keywords=keywords,
         license_info=data.get("licenseInfo"),
         access_information=data.get("accessInformation"),
+        tile_cache=parse_tile_info(data),
     )
 
 
