@@ -172,7 +172,7 @@ class ExtractionConfig:
             reading them. It turns one request per cache tile into one request
             per block for the empty parts of a sparse cache (issue #870). It
             is a heuristic, because a cache pyramid can drop a thin feature at
-            a coarse level. Set it False to read every cache tile.
+            a coarse level. It is off by default.
     """
 
     tile_size: int = 4096
@@ -184,7 +184,7 @@ class ExtractionConfig:
     max_concurrent: int = 4
     rate_limit_delay: float = DEFAULT_RATE_LIMIT_DELAY
     catalog_id: str | None = None
-    coarse_scan: bool = True
+    coarse_scan: bool = False
 
     # Legacy compatibility: accept compression directly
     compression: str | None = None
@@ -759,6 +759,62 @@ class _TilePlan:
     lod: LevelOfDetail | None = None
 
 
+def _extent_in_cache_crs(
+    metadata: ImageServerMetadata,
+    extent: dict[str, Any],
+    cache: TileCacheInfo,
+) -> tuple[dict[str, Any], float]:
+    """Convert an extent and the service pixel size to the cache CRS.
+
+    The cache grid arithmetic subtracts the cache origin from the extent, so
+    both must use the same CRS. The pixel size keeps the pixel count across
+    the extent, so the reader selects a level of the same detail.
+
+    Args:
+        metadata: Service metadata.
+        extent: Extent to cover, in the service CRS.
+        cache: Cache grid.
+
+    Returns:
+        Tuple of the extent and the pixel size, both in the cache CRS.
+
+    Raises:
+        ImageServerExtractionError: If the extent cannot be reprojected.
+    """
+    service_sr = metadata.full_extent.get("spatialReference") or {}
+    if not (service_sr.get("latestWkid") or service_sr.get("wkid")):
+        # get_crs_string() would guess EPSG:4326. Assume the cache CRS instead.
+        return extent, metadata.pixel_size_x
+    service_crs = metadata.get_crs_string()
+    try:
+        cache_crs = cache.crs_string()
+    except TileCacheError as e:
+        raise ImageServerExtractionError(str(e)) from e
+    if service_crs == cache_crs:
+        return extent, metadata.pixel_size_x
+
+    from pyproj import CRS, Transformer
+
+    try:
+        transformer = Transformer.from_crs(
+            CRS.from_string(service_crs), CRS.from_string(cache_crs), always_xy=True
+        )
+        xmin, ymin, xmax, ymax = transformer.transform_bounds(
+            extent["xmin"], extent["ymin"], extent["xmax"], extent["ymax"], densify_pts=21
+        )
+    except Exception as e:
+        raise ImageServerExtractionError(
+            f"Cannot reproject the service extent from {service_crs} to the cache CRS "
+            f"{cache_crs}: {e}"
+        ) from e
+
+    source_width = extent["xmax"] - extent["xmin"]
+    pixel_size = metadata.pixel_size_x
+    if source_width > 0 and pixel_size > 0:
+        pixel_size = pixel_size * (xmax - xmin) / source_width
+    return {"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax}, pixel_size
+
+
 def _plan_tiles(
     metadata: ImageServerMetadata,
     extent: dict[str, Any],
@@ -780,7 +836,8 @@ def _plan_tiles(
 
     Raises:
         ImageServerExtractionError: If the service rejects exportImage and
-            publishes no tile cache, so no path can read it.
+            publishes no tile cache, so no path can read it. Also if the
+            extent cannot be reprojected to the cache CRS.
     """
     if metadata.export_image_supported:
         tiles = list(
@@ -801,7 +858,8 @@ def _plan_tiles(
             "has no way to read it."
         )
 
-    lod = cache.select_lod(metadata.pixel_size_x)
+    extent, pixel_size = _extent_in_cache_crs(metadata, extent, cache)
+    lod = cache.select_lod(pixel_size)
     info(
         f"Service serves only cached tiles. Reading level {lod.level} "
         f"({lod.resolution:g} units per pixel) from the {cache.tile_format} cache."
@@ -816,8 +874,8 @@ def _warn_on_cache_request_count(tiles: list[TileSpec], cache: TileCacheInfo) ->
     The reader must ask for every cache tile of every block it keeps, because
     the cache reports an empty tile the same way at every level. A full-extent
     read of a continental service costs hundreds of thousands of requests, so
-    the user must see the number before the reads start (issue #870). The
-    coarse scan runs first, so this counts only the blocks that hold data.
+    the user must see the number before the reads start (issue #870). When
+    the coarse scan runs, this counts only the blocks that hold data.
 
     Args:
         tiles: Output tiles the reader still has to read.
@@ -1116,15 +1174,8 @@ def _load_effective_config(config: ExtractionConfig, output_dir: Path) -> Extrac
         catalog_cog_settings = get_cog_settings(output_dir)
         if catalog_cog_settings != CogSettings():
             info(f"Using COG settings from config: {catalog_cog_settings.compression}")
-            return ExtractionConfig(
-                tile_size=config.tile_size,
-                cog_settings=catalog_cog_settings,
-                max_retries=config.max_retries,
-                dry_run=config.dry_run,
-                timeout=config.timeout,
-                max_concurrent=config.max_concurrent,
-                rate_limit_delay=config.rate_limit_delay,
-            )
+            # replace() keeps every other option, such as raw and catalog_id.
+            return replace(config, cog_settings=catalog_cog_settings)
     except Exception as e:
         logger.debug("Could not load COG settings from config: %s", e)
 

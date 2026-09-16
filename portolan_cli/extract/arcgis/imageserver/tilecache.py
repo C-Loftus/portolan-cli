@@ -596,7 +596,7 @@ async def probe_block_empty(
     The caller skips the block when this returns True. Any doubt returns
     False, so a failed probe costs a full read rather than lost data. The
     answer is a heuristic: a cache pyramid can drop a thin feature at a coarse
-    level, so ``--no-coarse-scan`` turns the check off.
+    level, so the check runs only with ``--coarse-scan``.
 
     Args:
         service_url: ImageServer base URL.

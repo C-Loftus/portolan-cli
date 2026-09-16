@@ -91,6 +91,32 @@ def sample_tile() -> TileSpec:
 
 
 @pytest.mark.unit
+class TestLoadEffectiveConfig:
+    """COG settings from config.yaml must not reset other options."""
+
+    def test_catalog_cog_settings_keep_the_other_options(self, tmp_path: Path) -> None:
+        from portolan_cli.conversion_config import CogSettings
+        from portolan_cli.extract.arcgis.imageserver.extractor import _load_effective_config
+
+        config = ExtractionConfig(
+            tile_size=1024, raw=True, catalog_id="my-catalog", coarse_scan=True
+        )
+        catalog_settings = CogSettings(compression="JPEG")
+
+        with patch(
+            "portolan_cli.extract.arcgis.imageserver.extractor.get_cog_settings",
+            return_value=catalog_settings,
+        ):
+            effective = _load_effective_config(config, tmp_path)
+
+        assert effective.cog_settings == catalog_settings
+        assert effective.tile_size == 1024
+        assert effective.raw is True
+        assert effective.catalog_id == "my-catalog"
+        assert effective.coarse_scan is True
+
+
+@pytest.mark.unit
 class TestExtractionConfig:
     """Tests for ExtractionConfig dataclass."""
 
@@ -1068,6 +1094,64 @@ class TestTilePlanning:
 
         with pytest.raises(ImageServerExtractionError, match="TilesOnly"):
             _plan_tiles(no_cache, no_cache.full_extent, ExtractionConfig())
+
+    def test_cache_grid_reprojects_a_service_extent_in_another_crs(
+        self, tiles_only_metadata: ImageServerMetadata
+    ) -> None:
+        from dataclasses import replace as dc_replace
+
+        from pyproj import Transformer
+
+        from portolan_cli.extract.arcgis.imageserver.extractor import _plan_tiles
+
+        # The service reports its extent in EPSG:4326, but the cache grid is in
+        # EPSG:3857. The plan must match the plan for the same area in 3857.
+        extent = tiles_only_metadata.full_extent
+        to_wgs84 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+        xmin, ymin, xmax, ymax = to_wgs84.transform_bounds(
+            extent["xmin"], extent["ymin"], extent["xmax"], extent["ymax"]
+        )
+        wgs84_extent = {
+            "xmin": xmin,
+            "ymin": ymin,
+            "xmax": xmax,
+            "ymax": ymax,
+            "spatialReference": {"wkid": 4326},
+        }
+        pixel_deg = 30.0 * (xmax - xmin) / (extent["xmax"] - extent["xmin"])
+        wgs84 = dc_replace(
+            tiles_only_metadata,
+            full_extent=wgs84_extent,
+            pixel_size_x=pixel_deg,
+            pixel_size_y=pixel_deg,
+        )
+
+        expected = _plan_tiles(tiles_only_metadata, extent, ExtractionConfig(tile_size=512))
+        plan = _plan_tiles(wgs84, wgs84_extent, ExtractionConfig(tile_size=512))
+
+        assert plan.lod == expected.lod
+        assert [(t.x, t.y, t.width_px, t.height_px) for t in plan.tiles] == [
+            (t.x, t.y, t.width_px, t.height_px) for t in expected.tiles
+        ]
+        for got, want in zip(plan.tiles, expected.tiles, strict=True):
+            assert got.bbox == pytest.approx(want.bbox, abs=1e-3)
+
+    def test_cache_grid_fails_when_the_extent_cannot_be_reprojected(
+        self, tiles_only_metadata: ImageServerMetadata
+    ) -> None:
+        from dataclasses import replace as dc_replace
+
+        from portolan_cli.extract.arcgis.imageserver.extractor import _plan_tiles
+
+        cache = tiles_only_metadata.tile_cache
+        assert cache is not None
+        unknown = dc_replace(
+            tiles_only_metadata,
+            tile_cache=dc_replace(cache, spatial_reference={"wkid": 999999}),
+        )
+
+        with pytest.raises(ImageServerExtractionError, match="cache CRS"):
+            _plan_tiles(unknown, unknown.full_extent, ExtractionConfig(tile_size=512))
 
 
 @pytest.mark.unit

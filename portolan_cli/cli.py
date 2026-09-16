@@ -6771,11 +6771,12 @@ def extract() -> None:
 )
 @click.option(
     "--coarse-scan/--no-coarse-scan",
-    default=True,
+    default=False,
     help=(
         "[ImageServer] For a cache-only service, ask a coarse cache level which "
-        "blocks hold data before reading them (default: on). It makes a sparse "
-        "service much faster. Turn it off to read every cache tile."
+        "blocks hold data before reading them (default: off). It makes a sparse "
+        "service much faster, but it can skip a thin feature that the coarse "
+        "level drops."
     ),
 )
 @click.option(

@@ -66,7 +66,7 @@ class ImageServerCLIOptions:
         license_url: URL of the license text from --license-url.
         coarse_scan: Ask a coarse tile cache level which blocks hold data
             before reading them (issue #870). Only a cache-only service uses
-            it.
+            it. It is off by default, because the scan can skip a thin feature.
     """
 
     tile_size: int = 4096
@@ -84,7 +84,7 @@ class ImageServerCLIOptions:
     catalog_id: str | None = None
     license: str | None = None
     license_url: str | None = None
-    coarse_scan: bool = True
+    coarse_scan: bool = False
 
 
 def _create_progress_callback(
