@@ -51,6 +51,13 @@ DEFAULT_CACHE_CONCURRENCY = 8
 # Capability that marks a service as cache-only.
 TILES_ONLY_CAPABILITY = "tilesonly"
 
+# A service extent and its cache origin come from different fields of the
+# service JSON, so they disagree by a few nanometres even when they describe
+# the same corner. A pixel bound within this distance of a whole pixel snaps
+# to it. Without the snap a 1.86e-09 metre difference adds a row of 1 pixel
+# tall tiles across the top of the grid (issue #870).
+PIXEL_SNAP_TOLERANCE = 1e-6
+
 
 class TileCacheError(Exception):
     """Error while reading an ImageServer tile cache.
@@ -262,6 +269,22 @@ def _parse_lods(raw: Any) -> tuple[LevelOfDetail, ...]:
     return tuple(lods)
 
 
+def _snap_to_pixel(value: float) -> float:
+    """Round a pixel bound that sits within a tolerance of a whole pixel.
+
+    Args:
+        value: Pixel bound, which can carry float noise.
+
+    Returns:
+        The nearest whole pixel when it is within PIXEL_SNAP_TOLERANCE, and
+        the value itself otherwise.
+    """
+    nearest = round(value)
+    if abs(value - nearest) < PIXEL_SNAP_TOLERANCE:
+        return float(nearest)
+    return value
+
+
 def compute_cache_tile_grid(
     extent: dict[str, float],
     cache: TileCacheInfo,
@@ -287,10 +310,10 @@ def compute_cache_tile_grid(
     block_w = max(cache.tile_width, (tile_size // cache.tile_width) * cache.tile_width)
     block_h = max(cache.tile_height, (tile_size // cache.tile_height) * cache.tile_height)
 
-    left = math.floor((extent["xmin"] - cache.origin_x) / resolution)
-    right = math.ceil((extent["xmax"] - cache.origin_x) / resolution)
-    top = math.floor((cache.origin_y - extent["ymax"]) / resolution)
-    bottom = math.ceil((cache.origin_y - extent["ymin"]) / resolution)
+    left = math.floor(_snap_to_pixel((extent["xmin"] - cache.origin_x) / resolution))
+    right = math.ceil(_snap_to_pixel((extent["xmax"] - cache.origin_x) / resolution))
+    top = math.floor(_snap_to_pixel((cache.origin_y - extent["ymax"]) / resolution))
+    bottom = math.ceil(_snap_to_pixel((cache.origin_y - extent["ymin"]) / resolution))
 
     start_col = (left // block_w) * block_w
     start_row = (top // block_h) * block_h

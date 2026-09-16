@@ -255,6 +255,53 @@ class TestComputeCacheTileGrid:
         assert [t.width_px for t in tiles] == [412, 512]
         assert tiles[1].bbox[0] == pytest.approx(ORIGIN_X + 512 * 30.0)
 
+    def test_float_noise_in_the_extent_makes_no_sliver_row(
+        self, cache: TileCacheInfo, lod_native: LevelOfDetail
+    ) -> None:
+        # A live service reports an extent whose ymax sits 1.86e-09 above the
+        # cache origin. Without a snap the grid starts one pixel high, which
+        # adds a row of 1 pixel tall tiles and shifts every block index by one.
+        extent = {
+            "xmin": ORIGIN_X,
+            "ymin": ORIGIN_Y - 1024 * 30.0,
+            "xmax": ORIGIN_X + 1024 * 30.0,
+            "ymax": ORIGIN_Y + 1.862645149230957e-09,
+        }
+        tiles = list(compute_cache_tile_grid(extent, cache, lod_native, tile_size=512))
+
+        assert {t.height_px for t in tiles} == {512}
+        assert {t.y for t in tiles} == {0, 1}
+        assert tiles[0].bbox[3] == pytest.approx(ORIGIN_Y)
+
+    def test_float_noise_on_the_left_edge_makes_no_sliver_column(
+        self, cache: TileCacheInfo, lod_native: LevelOfDetail
+    ) -> None:
+        extent = {
+            "xmin": ORIGIN_X - 1.862645149230957e-09,
+            "ymin": ORIGIN_Y - 512 * 30.0,
+            "xmax": ORIGIN_X + 1024 * 30.0,
+            "ymax": ORIGIN_Y,
+        }
+        tiles = list(compute_cache_tile_grid(extent, cache, lod_native, tile_size=512))
+
+        assert {t.width_px for t in tiles} == {512}
+        assert {t.x for t in tiles} == {0, 1}
+
+    def test_a_real_partial_tile_still_survives_the_snap(
+        self, cache: TileCacheInfo, lod_native: LevelOfDetail
+    ) -> None:
+        # The snap must not swallow a genuine partial pixel row. A 600 px
+        # extent still yields a 512 px tile and an 88 px tile.
+        extent = {
+            "xmin": ORIGIN_X,
+            "ymin": ORIGIN_Y - 600 * 30.0,
+            "xmax": ORIGIN_X + 512 * 30.0,
+            "ymax": ORIGIN_Y,
+        }
+        tiles = list(compute_cache_tile_grid(extent, cache, lod_native, tile_size=512))
+
+        assert [t.height_px for t in tiles] == [512, 88]
+
     def test_tile_size_below_one_cache_tile_still_reads_one_cache_tile(
         self, cache: TileCacheInfo, lod_native: LevelOfDetail
     ) -> None:
