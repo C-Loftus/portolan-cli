@@ -1,4 +1,4 @@
-# Issue: the lerc package ships no Linux aarch64 binary
+# Issue: the lerc package includes no Linux aarch64 binary
 
 ## Symptom
 
@@ -44,11 +44,11 @@ decoder.
 ## Constraint accepted
 
 `tilecache.py` calls `_load_lerc` from the decode path, not at module import.
-Three things follow:
+This placement has these effects:
 
 - An install on Linux aarch64 works, and every other Portolan command works.
-- The message names the service that needed the package. It separates the two
+- The message specifies the service that needed the package. It separates the two
   failures: an absent package says to install it, and an unloadable binary
-  says which platforms carry one.
+  says which platforms include one.
 - A cache that stores PNG or JPEG reads on every platform, because rasterio
   decodes those tiles.

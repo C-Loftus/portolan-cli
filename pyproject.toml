@@ -234,7 +234,8 @@ skips = [] # Add specific checks to skip if needed, e.g., ["B101"]
 # French words from Belgian ISO 19139 test fixture (tests/fixtures/csw/belgium_buildings_iso19139.xml)
 # "BU" is the INSPIRE theme code for Buildings (used in test fixtures)
 # "disjointness" is a real set-theory term (codespell wants "disjointedness")
-ignore-words-list = "nd,bu,ue,adresse,projet,environnement,copie,explicite,connexion,objets,visibles,issus,fonction,mesures,informations,disjointness"
+# "lod" is the ArcGIS tile cache term for a level of detail (the tileInfo "lods" array)
+ignore-words-list = "nd,bu,ue,adresse,projet,environnement,copie,explicite,connexion,objets,visibles,issus,fonction,mesures,informations,disjointness,lod"
 
 # ---------- dead code ----------
 

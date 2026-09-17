@@ -8,7 +8,7 @@ Issue #870 shows this against the USGS NAIP service with `--tile-size 3000`
 and the default four concurrent requests. Five of twelve tiles failed after
 three attempts each.
 
-Since September 2026 the failure line names the reason. It quotes the ArcGIS
+Since September 2026 the failure line gives the reason. It quotes the ArcGIS
 `error.message` and `error.details` when the body is JSON, an excerpt of the
 body otherwise, and the full `exportImage` URL in every case. The run then
 prints a recovery hint.

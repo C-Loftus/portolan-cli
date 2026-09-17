@@ -1629,6 +1629,34 @@ def _record_coarse_empty_tiles(
         )
 
 
+def _clamp_tile_size(config: ExtractionConfig, metadata: ImageServerMetadata) -> ExtractionConfig:
+    """Clamp the tile size to the exportImage limits of the service.
+
+    This is the proactive check of issue #335. The limits describe exportImage.
+    A cache-only service ignores them, because its tiles come at the size the
+    cache stores (issue #870).
+    """
+    max_tile_size = min(metadata.max_image_width, metadata.max_image_height)
+    if not metadata.export_image_supported or config.tile_size <= max_tile_size:
+        return config
+    warn(
+        f"Requested tile size ({config.tile_size}px) exceeds service limit "
+        f"({max_tile_size}px). Auto-adjusting to {max_tile_size}px."
+    )
+    # Use dataclasses.replace to preserve all fields (including compression)
+    return replace(config, tile_size=max_tile_size)
+
+
+def _report_tile_counts(stats: _ProcessingStats, report_path: Path) -> None:
+    """Print the downloaded, empty, and failed tile counts of a run."""
+    success(f"Extracted {stats.tiles_downloaded} tiles ({stats.total_bytes:,} bytes)")
+    if stats.tiles_empty > 0:
+        info(f"Skipped {stats.tiles_empty} tiles that hold no data")
+    if stats.tiles_failed > 0:
+        error(f"Failed: {stats.tiles_failed} tiles")
+    info(f"Report: {report_path}")
+
+
 async def extract_imageserver(
     url: str,
     output_dir: Path,
@@ -1690,17 +1718,7 @@ async def extract_imageserver(
     metadata = await discover_imageserver(url, timeout=config.timeout)
     info(f"Service: {metadata.name} ({metadata.pixel_type}, {metadata.band_count} bands)")
 
-    # Validate tile size against service limits (proactive check per issue #335).
-    # The limits describe exportImage. A cache-only service ignores them, because
-    # its tiles come at the size the cache stores (issue #870).
-    max_tile_size = min(metadata.max_image_width, metadata.max_image_height)
-    if metadata.export_image_supported and config.tile_size > max_tile_size:
-        warn(
-            f"Requested tile size ({config.tile_size}px) exceeds service limit "
-            f"({max_tile_size}px). Auto-adjusting to {max_tile_size}px."
-        )
-        # Use dataclasses.replace to preserve all fields (including compression)
-        config = replace(config, tile_size=max_tile_size)
+    config = _clamp_tile_size(config, metadata)
 
     # Get service CRS for bbox reprojection
     service_crs = metadata.get_crs_string()
@@ -1804,12 +1822,7 @@ async def extract_imageserver(
     # Seed metadata.yaml from extracted service metadata
     _seed_metadata_from_report(output_dir, report, resolved_license)
 
-    success(f"Extracted {stats.tiles_downloaded} tiles ({stats.total_bytes:,} bytes)")
-    if stats.tiles_empty > 0:
-        info(f"Skipped {stats.tiles_empty} tiles that hold no data")
-    if stats.tiles_failed > 0:
-        error(f"Failed: {stats.tiles_failed} tiles")
-    info(f"Report: {report_path}")
+    _report_tile_counts(stats, report_path)
 
     # Auto-init catalog using Portolan API (unless raw mode)
     catalog_initialized = False
