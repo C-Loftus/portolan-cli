@@ -20,6 +20,35 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.unit
 
+SERVICE_URL = "https://example.com/rest/services/Test/ImageServer"
+
+
+def _one_tile_mock() -> AsyncMock:
+    """Build an extract_imageserver mock that reports one downloaded tile."""
+    mock_result = MagicMock()
+    mock_result.tiles_downloaded = 1
+    mock_result.tiles_failed = 0
+    mock_result.tiles_skipped = 0
+    mock_result.total_bytes = 10
+    return AsyncMock(return_value=mock_result)
+
+
+async def _run_with_mock(
+    mock_extract: AsyncMock,
+    tmp_path: Path,
+    options: ImageServerCLIOptions,
+) -> None:
+    """Run the orchestrator against a patched extract_imageserver."""
+    with patch(
+        "portolan_cli.extract.arcgis.imageserver.orchestrator.extract_imageserver",
+        mock_extract,
+    ):
+        await run_imageserver_extraction(
+            url=SERVICE_URL,
+            output_dir=tmp_path,
+            options=options,
+        )
+
 
 class TestImageServerCLIOptions:
     """Tests for ImageServerCLIOptions dataclass."""
@@ -203,22 +232,8 @@ class TestRetriesAndFailureHint:
 
     @pytest.mark.asyncio
     async def test_max_retries_passed_to_extraction_config(self, tmp_path: Path) -> None:
-        mock_result = MagicMock()
-        mock_result.tiles_downloaded = 1
-        mock_result.tiles_failed = 0
-        mock_result.tiles_skipped = 0
-        mock_result.total_bytes = 10
-        mock_extract = AsyncMock(return_value=mock_result)
-
-        with patch(
-            "portolan_cli.extract.arcgis.imageserver.orchestrator.extract_imageserver",
-            mock_extract,
-        ):
-            await run_imageserver_extraction(
-                url="https://example.com/rest/services/Test/ImageServer",
-                output_dir=tmp_path,
-                options=ImageServerCLIOptions(max_retries=5),
-            )
+        mock_extract = _one_tile_mock()
+        await _run_with_mock(mock_extract, tmp_path, ImageServerCLIOptions(max_retries=5))
 
         config = mock_extract.call_args.kwargs["config"]
         assert config.max_retries == 5
@@ -308,24 +323,12 @@ class TestLicenseOptions:
 
     @pytest.mark.asyncio
     async def test_license_options_passed_to_extractor(self, tmp_path: Path) -> None:
-        mock_result = MagicMock()
-        mock_result.tiles_downloaded = 1
-        mock_result.tiles_failed = 0
-        mock_result.tiles_skipped = 0
-        mock_result.total_bytes = 10
-        mock_extract = AsyncMock(return_value=mock_result)
-
-        with patch(
-            "portolan_cli.extract.arcgis.imageserver.orchestrator.extract_imageserver",
+        mock_extract = _one_tile_mock()
+        await _run_with_mock(
             mock_extract,
-        ):
-            await run_imageserver_extraction(
-                url="https://example.com/rest/services/Test/ImageServer",
-                output_dir=tmp_path,
-                options=ImageServerCLIOptions(
-                    license="other", license_url="https://example.com/terms.html"
-                ),
-            )
+            tmp_path,
+            ImageServerCLIOptions(license="other", license_url="https://example.com/terms.html"),
+        )
 
         call_kwargs = mock_extract.call_args.kwargs
         assert call_kwargs["license_id"] == "other"
@@ -356,3 +359,62 @@ class TestLicenseOptions:
         assert exit_code == 1
         assert report is None
         assert "No usable license for this extraction" in capsys.readouterr().err
+
+
+class TestEmptyTileOutcome:
+    """An all-empty run fails, but a resumed run with completed tiles does not."""
+
+    @staticmethod
+    def _result(downloaded: int, empty: int, skipped: int) -> MagicMock:
+        """Build an extraction result with the given tile counts."""
+        result = MagicMock()
+        result.tiles_downloaded = downloaded
+        result.tiles_empty = empty
+        result.tiles_skipped = skipped
+        result.tiles_failed = 0
+        result.total_bytes = 0
+        return result
+
+    @pytest.mark.asyncio
+    async def test_an_all_empty_first_run_fails(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A run that reads no data and skips nothing reports the empty extent."""
+        mock_extract = AsyncMock(return_value=self._result(0, 4, 0))
+
+        with patch(
+            "portolan_cli.extract.arcgis.imageserver.orchestrator.extract_imageserver",
+            mock_extract,
+        ):
+            exit_code, _ = await run_imageserver_extraction(
+                url=SERVICE_URL,
+                output_dir=tmp_path,
+                options=ImageServerCLIOptions(),
+            )
+
+        assert exit_code == 1
+        assert "all 4 tiles are empty" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_run_with_skipped_tiles_succeeds(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A resumed run holds the data its earlier run wrote (CodeRabbit review).
+
+        Before the fix the counters read as a total failure. The earlier run
+        wrote every tile, so the resumed run downloads none and skips them all.
+        """
+        mock_extract = AsyncMock(return_value=self._result(0, 2, 6))
+
+        with patch(
+            "portolan_cli.extract.arcgis.imageserver.orchestrator.extract_imageserver",
+            mock_extract,
+        ):
+            exit_code, _ = await run_imageserver_extraction(
+                url=SERVICE_URL,
+                output_dir=tmp_path,
+                options=ImageServerCLIOptions(resume=True),
+            )
+
+        assert exit_code == 0
+        assert "Extraction produced no data" not in capsys.readouterr().err

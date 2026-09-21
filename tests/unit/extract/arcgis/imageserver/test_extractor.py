@@ -847,7 +847,6 @@ class TestFailedTileOutput:
             resume_state=state,
             index=0,
             total=1,
-            output_dir=tmp_path,
             duration=1.0,
             error_msg="Tile download failed (tile_0_0): HTTP 500 (empty response body)",
             attempts=3,
@@ -976,6 +975,88 @@ class TestLicenseResolution:
 
         assert not (tmp_path / "tiles").exists() or not any((tmp_path / "tiles").iterdir())
         assert not (tmp_path / ".portolan" / "imageserver-resume.json").exists()
+
+
+@pytest.mark.unit
+class TestResumeSplitRunsBeforeTheCoarseScan:
+    """A completed tile stays skipped, and the coarse scan never sees it."""
+
+    @staticmethod
+    async def _run(
+        tmp_path: Path,
+        metadata: ImageServerMetadata,
+        resume_state: Any,
+    ) -> tuple[Any, list[list[TileSpec]]]:
+        """Extract with the scan and the downloader replaced by recorders."""
+        from portolan_cli.extract.arcgis.imageserver.extractor import _ProcessingStats
+
+        scanned: list[list[TileSpec]] = []
+
+        async def fake_scan(
+            url: str, tiles: list[TileSpec], plan: Any, config: ExtractionConfig
+        ) -> tuple[list[TileSpec], list[TileSpec]]:
+            scanned.append(list(tiles))
+            return list(tiles), []
+
+        async def fake_extract_all(*args: Any, **kwargs: Any) -> _ProcessingStats:
+            return _ProcessingStats()
+
+        with (
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor.discover_imageserver",
+                new_callable=AsyncMock,
+                return_value=metadata,
+            ),
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor._load_or_create_resume_state",
+                return_value=resume_state,
+            ),
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor._scan_for_empty_blocks",
+                fake_scan,
+            ),
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor._extract_all_tiles",
+                fake_extract_all,
+            ),
+        ):
+            result = await extract_imageserver(
+                "https://example.com/ImageServer",
+                tmp_path,
+                config=ExtractionConfig(tile_size=4096, raw=True, coarse_scan=True),
+                resume=True,
+            )
+        return result, scanned
+
+    @pytest.mark.asyncio
+    async def test_a_completed_tile_is_not_scanned_and_stays_skipped(
+        self, tmp_path: Path, sample_metadata: ImageServerMetadata
+    ) -> None:
+        """The scan reads the pending tiles only (CodeRabbit review of issue #870).
+
+        Before the fix the scan ran over every tile. A completed tile that the
+        coarse level called empty lost its "skipped" status and was counted as
+        empty instead.
+        """
+        from datetime import datetime, timezone
+
+        from portolan_cli.extract.arcgis.imageserver.resume import ImageServerResumeState
+
+        state = ImageServerResumeState(
+            succeeded_tiles={(0, 0)},
+            failed_tiles=set(),
+            service_url="https://example.com/ImageServer",
+            started_at=datetime.now(timezone.utc),
+        )
+
+        result, scanned = await self._run(tmp_path, sample_metadata, state)
+
+        assert len(scanned) == 1
+        assert (0, 0) not in {(t.x, t.y) for t in scanned[0]}
+        assert result.tiles_skipped == 1
+        assert result.tiles_empty == 0
+        assert result.report is not None
+        assert [t.status for t in result.report.tiles if t.tile_id == "tile_0_0"] == ["skipped"]
 
 
 # =============================================================================
@@ -1184,6 +1265,32 @@ class TestTilesOnlyExtraction:
 
         return _build
 
+    @classmethod
+    async def _extract(
+        cls,
+        transport: httpx.MockTransport,
+        metadata: ImageServerMetadata,
+        tmp_path: Path,
+        config: ExtractionConfig,
+    ) -> Any:
+        """Run one extraction against a mock transport and mock discovery."""
+        with (
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor.discover_imageserver",
+                new_callable=AsyncMock,
+                return_value=metadata,
+            ),
+            patch(
+                "portolan_cli.extract.arcgis.imageserver.extractor.httpx.AsyncClient",
+                cls._client_factory(transport),
+            ),
+        ):
+            return await extract_imageserver(
+                "https://example.com/ImageServer",
+                tmp_path,
+                config=config,
+            )
+
     @pytest.mark.asyncio
     async def test_writes_a_cog_from_the_tile_cache(
         self, tmp_path: Path, tiles_only_metadata: ImageServerMetadata
@@ -1193,22 +1300,9 @@ class TestTilesOnlyExtraction:
         body = (LERC_FIXTURES / "lerc2d_level0_0_0.bin").read_bytes()
         transport = self._transport(body)
 
-        with (
-            patch(
-                "portolan_cli.extract.arcgis.imageserver.extractor.discover_imageserver",
-                new_callable=AsyncMock,
-                return_value=tiles_only_metadata,
-            ),
-            patch(
-                "portolan_cli.extract.arcgis.imageserver.extractor.httpx.AsyncClient",
-                self._client_factory(transport),
-            ),
-        ):
-            result = await extract_imageserver(
-                "https://example.com/ImageServer",
-                tmp_path,
-                config=ExtractionConfig(tile_size=512, raw=True),
-            )
+        result = await self._extract(
+            transport, tiles_only_metadata, tmp_path, ExtractionConfig(tile_size=512, raw=True)
+        )
 
         assert result.tiles_downloaded == 1
         assert result.tiles_failed == 0
@@ -1226,22 +1320,9 @@ class TestTilesOnlyExtraction:
         body = (LERC_FIXTURES / "lerc2d_empty.bin").read_bytes()
         transport = self._transport(body)
 
-        with (
-            patch(
-                "portolan_cli.extract.arcgis.imageserver.extractor.discover_imageserver",
-                new_callable=AsyncMock,
-                return_value=tiles_only_metadata,
-            ),
-            patch(
-                "portolan_cli.extract.arcgis.imageserver.extractor.httpx.AsyncClient",
-                self._client_factory(transport),
-            ),
-        ):
-            result = await extract_imageserver(
-                "https://example.com/ImageServer",
-                tmp_path,
-                config=ExtractionConfig(tile_size=512, raw=True),
-            )
+        result = await self._extract(
+            transport, tiles_only_metadata, tmp_path, ExtractionConfig(tile_size=512, raw=True)
+        )
 
         assert result.tiles_empty == 1
         assert result.tiles_downloaded == 0
@@ -1259,22 +1340,12 @@ class TestTilesOnlyExtraction:
 
         transport = httpx.MockTransport(handler)
 
-        with (
-            patch(
-                "portolan_cli.extract.arcgis.imageserver.extractor.discover_imageserver",
-                new_callable=AsyncMock,
-                return_value=tiles_only_metadata,
-            ),
-            patch(
-                "portolan_cli.extract.arcgis.imageserver.extractor.httpx.AsyncClient",
-                self._client_factory(transport),
-            ),
-        ):
-            result = await extract_imageserver(
-                "https://example.com/ImageServer",
-                tmp_path,
-                config=ExtractionConfig(tile_size=512, raw=True, max_retries=1),
-            )
+        result = await self._extract(
+            transport,
+            tiles_only_metadata,
+            tmp_path,
+            ExtractionConfig(tile_size=512, raw=True, max_retries=1),
+        )
 
         assert result.tiles_failed == 1
         assert result.report is not None
@@ -1346,6 +1417,17 @@ class TestCoarseScan:
         )
 
     @staticmethod
+    def _recording_handler(body: bytes) -> tuple[list[str], Any]:
+        """Serve one body for every request and record the paths it asked for."""
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.path)
+            return httpx.Response(200, content=body)
+
+        return seen, handler
+
+    @staticmethod
     async def _run(
         metadata: ImageServerMetadata,
         tmp_path: Path,
@@ -1371,41 +1453,33 @@ class TestCoarseScan:
             )
 
     @pytest.mark.asyncio
-    async def test_skips_a_block_the_coarse_level_calls_empty(
-        self, tmp_path: Path, tiles_only_metadata: ImageServerMetadata
+    @pytest.mark.parametrize(
+        ("coarse_scan", "requests", "level"),
+        [
+            # The scan asks level 5 once per block, and reads no tile at level 9.
+            (True, 2, "/tile/5/"),
+            # Without the scan each of the 2 blocks reads its 16 x 16 cache tiles.
+            (False, 512, "/tile/9/"),
+        ],
+        ids=["scan-on", "scan-off"],
+    )
+    async def test_the_scan_decides_how_many_cache_tiles_the_reader_asks_for(
+        self,
+        tmp_path: Path,
+        tiles_only_metadata: ImageServerMetadata,
+        coarse_scan: bool,
+        requests: int,
+        level: str,
     ) -> None:
         empty = (LERC_FIXTURES / "lerc2d_empty.bin").read_bytes()
-        seen: list[str] = []
+        seen, handler = self._recording_handler(empty)
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen.append(request.url.path)
-            return httpx.Response(200, content=empty)
-
-        result = await self._run(self._wide(tiles_only_metadata), tmp_path, handler, True)
+        result = await self._run(self._wide(tiles_only_metadata), tmp_path, handler, coarse_scan)
 
         assert result.tiles_empty == 2
         assert result.tiles_downloaded == 0
-        # Two probes at level 5, and no read at level 9.
-        assert len(seen) == 2
-        assert all("/tile/5/" in path for path in seen)
-
-    @pytest.mark.asyncio
-    async def test_reads_every_cache_tile_when_the_scan_is_off(
-        self, tmp_path: Path, tiles_only_metadata: ImageServerMetadata
-    ) -> None:
-        empty = (LERC_FIXTURES / "lerc2d_empty.bin").read_bytes()
-        seen: list[str] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen.append(request.url.path)
-            return httpx.Response(200, content=empty)
-
-        result = await self._run(self._wide(tiles_only_metadata), tmp_path, handler, False)
-
-        assert result.tiles_empty == 2
-        # Two blocks of 16 x 16 cache tiles, all read at level 9.
-        assert len(seen) == 512
-        assert all("/tile/9/" in path for path in seen)
+        assert len(seen) == requests
+        assert all(level in path for path in seen)
 
     @pytest.mark.asyncio
     async def test_reads_a_block_whose_coarse_tile_holds_data(

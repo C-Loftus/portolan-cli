@@ -80,6 +80,8 @@ from portolan_cli.output import detail, error, info, success, warn
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from portolan_cli.extract.arcgis.imageserver.discovery import ImageServerMetadata
+
 
 @dataclass
 class TileProgress:
@@ -381,7 +383,7 @@ def _describe_non_tiff_body(
         Error message.
     """
     # HTML error page
-    if content.startswith(b"<!") or content.startswith(b"<html"):
+    if content.startswith((b"<!", b"<html")):
         return (
             f"Server returned HTML instead of TIFF for tile {tile.get_id()}. Request: {export_url}"
         )
@@ -1114,10 +1116,9 @@ def _remove_empty_item_dir(item_dir: Path) -> None:
     Args:
         item_dir: Directory created for the tile.
     """
-    try:
+    # Best effort: a non-empty directory stays.
+    with contextlib.suppress(OSError):
         item_dir.rmdir()
-    except OSError:
-        pass  # Best effort: a non-empty directory stays.
 
 
 def _setup_extraction_dirs(output_dir: Path, collection_name: str = "tiles") -> tuple[Path, Path]:
@@ -1750,9 +1751,7 @@ async def extract_imageserver(
 
     # Ask a coarse cache level which blocks hold data, before reading any of
     # them at full resolution (issue #870).
-    tiles_to_process, coarse_empty = await _scan_for_empty_blocks(
-        url, pending_tiles, plan, config
-    )
+    tiles_to_process, coarse_empty = await _scan_for_empty_blocks(url, pending_tiles, plan, config)
     if plan.cache is not None:
         _warn_on_cache_request_count(tiles_to_process, plan.cache)
 

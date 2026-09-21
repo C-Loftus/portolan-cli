@@ -11,6 +11,7 @@ from portolan_cli.cli import cli
 
 if TYPE_CHECKING:
     from portolan_cli.extract.arcgis.auth import ArcGISCredentials
+    from portolan_cli.extract.arcgis.imageserver.orchestrator import ImageServerCLIOptions
 
 
 @pytest.mark.unit
@@ -365,6 +366,31 @@ def test_extract_arcgis_rejects_bad_id_before_imageserver_extraction(
     assert "Invalid catalog ID" in result.output
 
 
+IMAGESERVER_URL = "https://example.com/arcgis/rest/services/x/ImageServer"
+
+
+def _capture_imageserver_options(
+    monkeypatch: pytest.MonkeyPatch, extra_args: list[str]
+) -> list[ImageServerCLIOptions]:
+    """Run `extract arcgis` against a raster URL and capture the options it built."""
+    captured: list[ImageServerCLIOptions] = []
+
+    def _capture(url: str, output_dir: object, options: ImageServerCLIOptions) -> tuple[int, None]:
+        captured.append(options)
+        return 0, None
+
+    monkeypatch.setattr(
+        "portolan_cli.extract.arcgis.imageserver.orchestrator.run_imageserver_extraction_sync",
+        _capture,
+    )
+    runner = CliRunner()
+    result = runner.invoke(cli, ["extract", "arcgis", IMAGESERVER_URL, *extra_args, "--auto"])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    return captured
+
+
 @pytest.mark.unit
 def test_extract_arcgis_passes_retries_to_imageserver_options(
     monkeypatch: pytest.MonkeyPatch,
@@ -374,33 +400,8 @@ def test_extract_arcgis_passes_retries_to_imageserver_options(
     Before the fix the CLI accepted the flag and dropped it, so every tile
     got the default three attempts.
     """
-    from portolan_cli.extract.arcgis.imageserver.orchestrator import ImageServerCLIOptions
+    captured = _capture_imageserver_options(monkeypatch, ["--retries", "5"])
 
-    captured: list[ImageServerCLIOptions] = []
-
-    def _capture(url: str, output_dir: object, options: ImageServerCLIOptions) -> tuple[int, None]:
-        captured.append(options)
-        return 0, None
-
-    monkeypatch.setattr(
-        "portolan_cli.extract.arcgis.imageserver.orchestrator.run_imageserver_extraction_sync",
-        _capture,
-    )
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        [
-            "extract",
-            "arcgis",
-            "https://example.com/arcgis/rest/services/x/ImageServer",
-            "--retries",
-            "5",
-            "--auto",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert len(captured) == 1
     assert captured[0].max_retries == 5
 
 
@@ -409,34 +410,10 @@ def test_extract_arcgis_passes_license_to_imageserver_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`--license` and `--license-url` reach the raster path (issue #870)."""
-    from portolan_cli.extract.arcgis.imageserver.orchestrator import ImageServerCLIOptions
-
-    captured: list[ImageServerCLIOptions] = []
-
-    def _capture(url: str, output_dir: object, options: ImageServerCLIOptions) -> tuple[int, None]:
-        captured.append(options)
-        return 0, None
-
-    monkeypatch.setattr(
-        "portolan_cli.extract.arcgis.imageserver.orchestrator.run_imageserver_extraction_sync",
-        _capture,
-    )
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        [
-            "extract",
-            "arcgis",
-            "https://example.com/arcgis/rest/services/x/ImageServer",
-            "--license",
-            "other",
-            "--license-url",
-            "https://example.com/terms.html",
-            "--auto",
-        ],
+    captured = _capture_imageserver_options(
+        monkeypatch,
+        ["--license", "other", "--license-url", "https://example.com/terms.html"],
     )
 
-    assert result.exit_code == 0, result.output
-    assert len(captured) == 1
     assert captured[0].license == "other"
     assert captured[0].license_url == "https://example.com/terms.html"

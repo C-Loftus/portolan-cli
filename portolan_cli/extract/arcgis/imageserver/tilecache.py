@@ -27,9 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx
@@ -38,6 +36,9 @@ import numpy as np
 from portolan_cli.extract.arcgis.imageserver.tiling import TileSpec
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator, Sequence
+    from pathlib import Path
+
     from numpy.typing import NDArray
 
 # Tile cache formats this module can decode. LERC2D is what a hosted tiled
@@ -65,8 +66,6 @@ class TileCacheError(Exception):
     Raised when the cache rejects a request, when a tile does not decode, or
     when the cache format has no decoder here.
     """
-
-    pass
 
 
 @dataclass(frozen=True)

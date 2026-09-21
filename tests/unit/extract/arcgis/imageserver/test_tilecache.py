@@ -44,6 +44,21 @@ ORIGIN_Y = 5110175.25118694
 SERVICE_URL = "https://tiledimageservices.arcgis.com/QVEN/arcgis/rest/services/x/ImageServer"
 
 
+async def _assert_empty_tile(
+    handler: Any,
+    spec: TileSpec,
+    cache: TileCacheInfo,
+    lod: LevelOfDetail,
+    out: Path,
+) -> None:
+    """Read one tile through the handler and assert it holds no data."""
+    async with _client(handler) as client:
+        result = await fetch_cache_tile(SERVICE_URL, spec, out, client, cache, lod, "EPSG:3857")
+
+    assert result.empty is True
+    assert not out.exists()
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -521,13 +536,7 @@ class TestFetchCacheTile:
             return httpx.Response(404, text="<html>not found</html>")
 
         out = tmp_path / "tile.tif"
-        async with _client(handler) as client:
-            result = await fetch_cache_tile(
-                SERVICE_URL, spec, out, client, cache, lod_native, "EPSG:3857"
-            )
-
-        assert result.empty is True
-        assert not out.exists()
+        await _assert_empty_tile(handler, spec, cache, lod_native, out)
 
     @pytest.mark.asyncio
     async def test_reports_empty_when_every_pixel_is_masked(
@@ -541,13 +550,7 @@ class TestFetchCacheTile:
             return httpx.Response(200, content=LERC_EMPTY.read_bytes())
 
         out = tmp_path / "tile.tif"
-        async with _client(handler) as client:
-            result = await fetch_cache_tile(
-                SERVICE_URL, spec, out, client, cache, lod_native, "EPSG:3857"
-            )
-
-        assert result.empty is True
-        assert not out.exists()
+        await _assert_empty_tile(handler, spec, cache, lod_native, out)
 
     @pytest.mark.asyncio
     async def test_writes_the_tile_when_only_one_cache_tile_is_present(
