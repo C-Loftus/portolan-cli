@@ -82,8 +82,7 @@ jobs:
         # ONE rule source: CI runs the SAME hooks developers run locally
         # (prek.toml), not a re-listing of each tool with its own drifting args.
         # This covers ruff, ruff-format, mypy, import-linter, codespell, vulture,
-        # xenon, pylint-duplicate, bandit, deptry,
-        # actionlint, zizmor, and the builtin file hooks.
+        # jscpd, deptry, actionlint, zizmor, and the builtin file hooks.
         #
         # SKIP:
         # - no-commit-to-branch: meaningless in CI and fails on push-to-main
@@ -125,7 +124,7 @@ jobs:
       - name: Audit dependencies (runtime + extras only)
         # Audit only what we ship: core runtime deps plus the publishable extras
         # (iceberg, pmtiles, thumbnails). Dev-group deps (moto, pytest, pip-audit
-        # itself...) and doc-build deps (mkdocs, pymdown-extensions...) are excluded
+        # itself...) and doc-build deps (zensical, pymdown-extensions...) are excluded
         # because they never reach users via the wheel.
         #
         # Ignores come from the single-source .pip-audit-ignores file (each entry
@@ -378,7 +377,7 @@ jobs:
         run: uv run python scripts/generate_reference_docs.py --check
 
       - name: Build documentation
-        run: uv run mkdocs build --strict
+        run: uv run zensical build --strict --clean
 
       - name: Start MinIO for documentation example
         run: |

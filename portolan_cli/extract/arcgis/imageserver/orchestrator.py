@@ -26,9 +26,7 @@ Typical usage from CLI:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from portolan_cli.extract.arcgis.imageserver.extractor import (
@@ -39,6 +37,9 @@ from portolan_cli.extract.arcgis.imageserver.extractor import (
 from portolan_cli.output import detail, error, info, success, warn
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
     from portolan_cli.extract.arcgis.imageserver.report import ImageServerExtractionReport
 
 
@@ -208,8 +209,10 @@ async def run_imageserver_extraction(
             _print_failure_hint(result.tiles_failed)
             return 1, result.report
 
-        if result.tiles_downloaded == 0 and result.tiles_empty > 0:
+        if result.tiles_downloaded == 0 and result.tiles_empty > 0 and result.tiles_skipped == 0:
             # The service answered every request, and every tile holds no data.
+            # A resumed run that skips completed tiles holds data, so it is not
+            # a failure.
             error(
                 f"Extraction produced no data: all {result.tiles_empty} tiles are empty. "
                 "The service extent covers more area than its data does. "

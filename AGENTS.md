@@ -145,8 +145,9 @@ uv run ruff format .                    # Format
 uv run mypy portolan_cli                # Type check
 uv run deptry .                         # Check dependencies (unused, missing, transitive)
 uv run vulture portolan_cli tests       # Dead code
-uv run xenon --max-absolute=C portolan_cli  # Complexity
-uv run pylint --disable=all --enable=duplicate-code portolan_cli/  # Duplicate code
+uvx jscpd@5.2.1 portolan_cli tests \
+  --baseline .jscpd-baseline.json \
+  --fail-on-new-clones 0            # Duplicate code
 
 # Iceberg backend development
 uv sync --extra iceberg --extra dev     # Install with iceberg deps
@@ -158,8 +159,9 @@ uv run cz commit                        # Interactive commit
 uv run cz bump --dry-run                # Preview version bump
 
 # Docs
-uv run mkdocs serve                     # Local docs server
-uv run mkdocs build                     # Build docs
+uv run zensical serve                   # Local docs server
+uv run zensical build --strict --clean  # Build docs
+uv run pytest tests/docs/test_site_build.py  # Verify the built site
 ```
 
 ## Project Structure
@@ -180,7 +182,7 @@ portolan-cli/
 │   ├── benchmark/         # Performance measurements
 │   ├── snapshot/          # Snapshot tests
 │   └── iceberg/           # Iceberg backend tests (unit, integration, e2e)
-├── docs/                  # PUBLIC documentation (mkdocs) - tutorials, user guides
+├── docs/                  # PUBLIC documentation (Zensical) - tutorials, user guides
 ├── context/               # AI/INTERNAL development context
 │   └── shared/            # Plans, research, reports
 │       ├── documentation/ # CI, tooling, maintainer rationale
@@ -188,8 +190,22 @@ portolan-cli/
 └── .github/workflows/     # CI/CD pipelines
 ```
 
-`docs/` is public (mkdocs); `context/` is internal AI-oriented context. See
+`docs/` is public (Zensical); `context/` is internal AI-oriented context. See
 `.claude/rules/documentation.md` for the full distinction and where to file things.
+
+## Synced brand files
+
+The sync in portolan-ops owns these four files. They carry no `ops-sync` marker,
+because a CSS file and an SVG file cannot hold a Markdown comment in a place
+that a reader sees. Do not edit them here. Edit the source in portolan-ops and
+let the sync run.
+
+- `docs/assets/stylesheets/_brand-vars.css`
+- `docs/assets/images/portolan-logomark-4163cc.svg`
+- `docs/assets/images/portolan-logomark-fcfcfa.svg`
+- `docs/assets/images/portolan-logo-horizontal-light.svg`
+
+`context/shared/documentation/branding.md` records how the site applies them.
 
 ## Before Writing Code
 
@@ -228,7 +244,7 @@ Always research before implementing:
 - **ALL** non-obvious decisions are recorded where they apply (see `.claude/rules/documentation.md`)
 - **NO** new dependencies without discussion
 
-<!-- freshness: last-verified: 2026-08-31 -->
+<!-- freshness: last-verified: 2026-09-18 -->
 ## Design Principles
 
 | Principle | Meaning |
