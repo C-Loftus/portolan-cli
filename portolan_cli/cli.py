@@ -6384,16 +6384,20 @@ def _handle_imageserver_extraction(
     output_dir: Path,
     catalog_id: str | None,
     tile_size: int,
+    coarse_scan: bool,
     bbox: str | None,
     bbox_crs: str | None,
     compression: str | None,
     max_concurrent: int,
     timeout: float,
+    retries: int,
     resume: bool,
     dry_run: bool,
     json_output: bool,
     auto: bool,
     collection_name: str | None,
+    license_id: str | None = None,
+    license_url: str | None = None,
 ) -> None:
     """Handle ImageServer URL extraction (raster data)."""
     from portolan_cli.conversion_config import CogSettings, get_cog_settings
@@ -6453,7 +6457,9 @@ def _handle_imageserver_extraction(
     options = ImageServerCLIOptions(
         catalog_id=catalog_id,
         tile_size=tile_size,
+        coarse_scan=coarse_scan,
         max_concurrent=max_concurrent,
+        max_retries=retries,
         dry_run=dry_run,
         resume=resume,
         raw=False,  # ImageServer always creates STAC structure
@@ -6463,6 +6469,8 @@ def _handle_imageserver_extraction(
         compression=cog_settings.compression,
         use_json=json_output,
         collection_name=collection_name,
+        license=license_id,
+        license_url=license_url,
     )
 
     # Run extraction
@@ -6901,7 +6909,7 @@ def extract() -> None:
     "--retries",
     type=click.IntRange(min=1),
     default=3,
-    help="Retry attempts per failed layer (default: 3).",
+    help="Retry attempts per failed layer or tile (default: 3).",
 )
 @click.option(
     "--timeout",
@@ -6941,6 +6949,16 @@ def extract() -> None:
     type=click.IntRange(min=256, max=8192),
     default=4096,
     help="[ImageServer] Tile size in pixels (default: 4096).",
+)
+@click.option(
+    "--coarse-scan/--no-coarse-scan",
+    default=False,
+    help=(
+        "[ImageServer] For a cache-only service, ask a coarse cache level which "
+        "blocks hold data before reading them (default: off). It makes a sparse "
+        "service much faster, but it can skip a thin feature that the coarse "
+        "level drops."
+    ),
 )
 @click.option(
     "--bbox",
@@ -7021,6 +7039,7 @@ def extract_arcgis_cmd(
     auto: bool,
     raw: bool,
     tile_size: int,
+    coarse_scan: bool,
     bbox: str | None,
     bbox_crs: str | None,
     compression: str | None,
@@ -7154,16 +7173,20 @@ def extract_arcgis_cmd(
             output_dir=output_dir,
             catalog_id=catalog_id,
             tile_size=tile_size,
+            coarse_scan=coarse_scan,
             bbox=bbox,
             bbox_crs=bbox_crs,
             compression=compression,
             max_concurrent=max_concurrent,
             timeout=timeout,
+            retries=retries,
             resume=resume,
             dry_run=dry_run,
             json_output=use_json,
             auto=auto,
             collection_name=collection_name,
+            license_id=license_id,
+            license_url=license_url,
         )
         return
 
