@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import numpy as np
@@ -22,9 +23,11 @@ from portolan_cli.extract.arcgis.imageserver.tilecache import (
     LevelOfDetail,
     TileCacheError,
     TileCacheInfo,
+    TileCacheRateLimitError,
     cache_tile_refs,
     compute_cache_tile_grid,
     decode_tile_bytes,
+    ensure_cache_readable,
     export_image_supported,
     fetch_cache_tile,
     parse_tile_info,
@@ -42,6 +45,9 @@ LERC_EMPTY = FIXTURE_DIR / "lerc2d_empty.bin"
 ORIGIN_X = -12060495.1357351
 ORIGIN_Y = 5110175.25118694
 SERVICE_URL = "https://tiledimageservices.arcgis.com/QVEN/arcgis/rest/services/x/ImageServer"
+
+#: One cache tile at the grid origin, read at the 30 m native level.
+_ONE_TILE_BBOX = (ORIGIN_X, ORIGIN_Y - 256 * 30.0, ORIGIN_X + 256 * 30.0, ORIGIN_Y)
 
 
 async def _assert_empty_tile(
@@ -438,6 +444,30 @@ class TestDecodeTileBytes:
         with pytest.raises(TileCacheError, match="LERC"):
             decode_tile_bytes(b"Lerc2 " + b"\x00" * 40, "LERC2D")
 
+    def test_decodes_a_jpegplus_tile(self) -> None:
+        """JPEGPlus is an ArcGIS label for a plain JPEG payload.
+
+        The live service Imagery_2021 (EPSG:6447) serves such tiles, and each
+        one starts with the JPEG magic bytes (pull request #871 review).
+        """
+        jpeg = _jpeg_bytes()
+        assert jpeg[:2] == b"\xff\xd8"
+
+        data, mask = decode_tile_bytes(jpeg, "JPEGPlus")
+
+        assert data.shape == (1, 8, 8)
+        assert mask.all()
+
+
+def _jpeg_bytes() -> bytes:
+    """Build an 8x8 single-band JPEG in memory."""
+    from rasterio.io import MemoryFile
+
+    with MemoryFile() as memfile:
+        with memfile.open(driver="JPEG", width=8, height=8, count=1, dtype="uint8") as dataset:
+            dataset.write(np.full((1, 8, 8), 7, dtype=np.uint8))
+        return bytes(memfile.read())
+
 
 def _png_bytes() -> bytes:
     """Build a 4x4 single-band PNG in memory."""
@@ -779,3 +809,164 @@ class TestLercLoadFailure:
         assert "pip install lerc" not in message
         assert "The package is installed" in message
         assert "Linux x86-64" in message
+
+
+class TestEnsureCacheReadable:
+    """The reader checks the format and the decoder before it asks for a tile."""
+
+    @staticmethod
+    def _cache(tile_format: str) -> TileCacheInfo:
+        return TileCacheInfo(
+            tile_width=256,
+            tile_height=256,
+            tile_format=tile_format,
+            origin_x=ORIGIN_X,
+            origin_y=ORIGIN_Y,
+            lods=(LevelOfDetail(level=0, resolution=30.0),),
+            spatial_reference={"wkid": 3857},
+        )
+
+    def test_accepts_an_image_format(self) -> None:
+        ensure_cache_readable(self._cache("JPEGPLUS"))
+
+    def test_accepts_a_lerc_format(self) -> None:
+        ensure_cache_readable(self._cache("LERC2D"))
+
+    def test_rejects_a_format_with_no_decoder(self) -> None:
+        with pytest.raises(TileCacheError, match="BUNDLE"):
+            ensure_cache_readable(self._cache("BUNDLE"))
+
+    def test_reports_a_lerc_decoder_that_does_not_load(self) -> None:
+        """The lerc wheel carries no Linux aarch64 binary.
+
+        The import then raises OSError on every tile. The check reports it
+        once, before the run costs any request (pull request #871 review).
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fail_on_lerc(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "lerc":
+                raise OSError("libLerc.so.4: cannot open shared object file")
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch.object(builtins, "__import__", fail_on_lerc),
+            pytest.raises(TileCacheError, match="did not load"),
+        ):
+            ensure_cache_readable(self._cache("LERC2D"))
+
+
+class TestCrsString:
+    """A cache states its CRS as a well-known id, or as WKT."""
+
+    @staticmethod
+    def _cache(spatial_reference: dict[str, Any]) -> TileCacheInfo:
+        return TileCacheInfo(
+            tile_width=256,
+            tile_height=256,
+            tile_format="LERC2D",
+            origin_x=ORIGIN_X,
+            origin_y=ORIGIN_Y,
+            lods=(LevelOfDetail(level=0, resolution=30.0),),
+            spatial_reference=spatial_reference,
+        )
+
+    def test_prefers_the_latest_well_known_id(self) -> None:
+        assert self._cache({"wkid": 102100, "latestWkid": 3857}).crs_string() == "EPSG:3857"
+
+    def test_returns_the_wkt_when_the_cache_declares_no_id(self) -> None:
+        """A custom projection carries WKT alone, and that WKT is usable."""
+        wkt = 'PROJCS["Custom",GEOGCS["GCS_WGS_1984"],UNIT["Meter",1.0]]'
+
+        assert self._cache({"wkt": wkt}).crs_string() == wkt
+
+    def test_raises_when_the_cache_declares_nothing(self) -> None:
+        with pytest.raises(TileCacheError, match="no spatial reference"):
+            self._cache({}).crs_string()
+
+
+async def _fetch_one_cache_tile(
+    handler: Any,
+    cache: TileCacheInfo,
+    lod: LevelOfDetail,
+    out: Path,
+) -> None:
+    """Read one 256 px tile at the cache origin through the handler."""
+    spec = TileSpec(x=0, y=0, bbox=_ONE_TILE_BBOX, width_px=256, height_px=256)
+    async with _client(handler) as client:
+        await fetch_cache_tile(SERVICE_URL, spec, out, client, cache, lod, "EPSG:3857")
+
+
+class TestCacheRateLimitResponse:
+    """HTTP 429 from the cache is a wait, not a failure."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "retry_after"),
+        [({"Retry-After": "12"}, 12.0), ({}, None), ({"Retry-After": "Wed, 21 Oct"}, None)],
+        ids=["seconds", "no-header", "http-date"],
+    )
+    async def test_a_429_raises_the_rate_limit_error(
+        self,
+        cache: TileCacheInfo,
+        lod_native: LevelOfDetail,
+        tmp_path: Path,
+        headers: dict[str, str],
+        retry_after: float | None,
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, headers=headers)
+
+        with pytest.raises(TileCacheRateLimitError) as exc_info:
+            await _fetch_one_cache_tile(handler, cache, lod_native, tmp_path / "out.tif")
+
+        assert exc_info.value.retry_after == retry_after
+        assert "429" in str(exc_info.value)
+
+
+class TestFloatMosaicNodata:
+    """A float mosaic states its masked pixels as nan (PR #871 review)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("fixture", "dtype", "valid", "has_nodata"),
+        [
+            ("lerc2d_float32.bin", "float32", 43887, True),
+            ("lerc2d_level0_0_0.bin", "uint8", 2851, False),
+        ],
+        ids=["float32", "uint8"],
+    )
+    async def test_the_mosaic_states_its_masked_pixels(
+        self,
+        cache: TileCacheInfo,
+        lod_native: LevelOfDetail,
+        tmp_path: Path,
+        fixture: str,
+        dtype: str,
+        valid: int,
+        has_nodata: bool,
+    ) -> None:
+        """A float raster needs nan, because a mask alone does not survive.
+
+        rio-cogeo wraps the source in a WarpedVRT with an alpha band, and GDAL
+        builds a float alpha band for a float source. An integer raster keeps
+        its internal mask instead (pull request #871 review).
+        """
+        body = (FIXTURE_DIR / fixture).read_bytes()
+        out = tmp_path / "out.tif"
+
+        await _fetch_one_cache_tile(
+            lambda request: httpx.Response(200, content=body), cache, lod_native, out
+        )
+
+        with rasterio.open(out) as src:
+            assert src.dtypes[0] == dtype
+            assert int((src.dataset_mask() > 0).sum()) == valid
+            if has_nodata:
+                assert np.isnan(src.nodatavals[0])
+                assert np.isnan(src.read(1)[src.dataset_mask() == 0]).all()
+            else:
+                assert src.nodatavals[0] is None
+                assert int(src.read(1)[src.dataset_mask() == 0].max()) == 0

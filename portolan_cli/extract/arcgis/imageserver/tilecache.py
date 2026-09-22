@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 # Tile cache formats this module can decode. LERC2D is what a hosted tiled
 # imagery layer stores. The rest are the image formats a map cache stores.
 LERC_FORMATS = frozenset({"LERC", "LERC2D"})
-IMAGE_FORMATS = frozenset({"PNG", "PNG8", "PNG24", "PNG32", "JPG", "JPEG", "MIXED"})
+IMAGE_FORMATS = frozenset({"PNG", "PNG8", "PNG24", "PNG32", "JPG", "JPEG", "JPEGPLUS", "MIXED"})
 
 # Cache tiles to request at the same time inside one output tile.
 DEFAULT_CACHE_CONCURRENCY = 8
@@ -66,6 +66,28 @@ class TileCacheError(Exception):
     Raised when the cache rejects a request, when a tile does not decode, or
     when the cache format has no decoder here.
     """
+
+
+class TileCacheRateLimitError(TileCacheError):
+    """The cache answered HTTP 429, so the reader must wait.
+
+    The caller backs off and retries, rather than counting the tile as a
+    failure (pull request #871 review).
+
+    Attributes:
+        retry_after: Seconds the server asked the reader to wait, or None when
+            the response carries no Retry-After header.
+    """
+
+    def __init__(self, url: str, retry_after: float | None = None) -> None:
+        """Build the error.
+
+        Args:
+            url: Tile URL that the cache rate limited.
+            retry_after: Value of the Retry-After header, in seconds.
+        """
+        self.retry_after = retry_after
+        super().__init__(f"Cache read rate limited: HTTP 429 for {url}.")
 
 
 @dataclass(frozen=True)
@@ -109,18 +131,25 @@ class TileCacheInfo:
         return self.tile_format in LERC_FORMATS
 
     def crs_string(self) -> str:
-        """Return the cache CRS as an EPSG string.
+        """Return the cache CRS.
+
+        A service that defines its own projection carries no well-known id,
+        and states the CRS as WKT instead. That WKT is usable, so it is
+        returned as it stands (pull request #871 review).
 
         Returns:
-            CRS string such as ``EPSG:3857``.
+            CRS string such as ``EPSG:3857``, or the WKT of the cache CRS.
 
         Raises:
             TileCacheError: If the cache declares no spatial reference.
         """
         wkid = self.spatial_reference.get("latestWkid") or self.spatial_reference.get("wkid")
-        if not wkid:
-            raise TileCacheError("The tile cache declares no spatial reference.")
-        return f"EPSG:{wkid}"
+        if wkid:
+            return f"EPSG:{wkid}"
+        wkt = self.spatial_reference.get("wkt") or self.spatial_reference.get("wkt2")
+        if wkt:
+            return str(wkt)
+        raise TileCacheError("The tile cache declares no spatial reference.")
 
     def select_lod(self, pixel_size: float) -> LevelOfDetail:
         """Return the level whose resolution is closest to a pixel size.
@@ -380,6 +409,33 @@ def cache_tile_refs(
                 )
             )
     return refs
+
+
+def ensure_cache_readable(cache: TileCacheInfo) -> None:
+    """Check the cache format and its decoder before the first request.
+
+    Both failures below apply to every tile of the run. Without this check the
+    reader finds them once per tile, after the download, and the retry loop
+    repeats each one. The user then reads one message per attempt, and the
+    5xx hint tells them to lower --tile-size, which does not help
+    (pull request #871 review).
+
+    Args:
+        cache: Cache grid to read.
+
+    Raises:
+        TileCacheError: If the format has no decoder here, or the LERC
+            decoder does not load on this platform.
+    """
+    if cache.is_lerc:
+        _load_lerc()
+        return
+    if cache.tile_format in IMAGE_FORMATS:
+        return
+    raise TileCacheError(
+        f"Portolan cannot read the tile cache format '{cache.tile_format}'. "
+        f"It reads {', '.join(sorted(LERC_FORMATS | IMAGE_FORMATS))}."
+    )
 
 
 def decode_tile_bytes(content: bytes, tile_format: str) -> tuple[NDArray[Any], NDArray[np.bool_]]:
@@ -732,6 +788,7 @@ async def _download_cache_tile(
         cache answers HTTP 404 outside the data footprint, which is normal.
 
     Raises:
+        TileCacheRateLimitError: On HTTP 429, so the caller backs off.
         TileCacheError: On any other failure.
     """
     url = ref.url(service_url)
@@ -744,9 +801,51 @@ async def _download_cache_tile(
 
     if response.status_code == 404:
         return None
+    if response.status_code == 429:
+        raise TileCacheRateLimitError(url, _retry_after_seconds(response))
     if response.status_code != 200:
         raise TileCacheError(f"Cache read failed: HTTP {response.status_code} for {url}.")
     return response.content
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Read the Retry-After header as a number of seconds.
+
+    Args:
+        response: Response that carries the header.
+
+    Returns:
+        The delay in seconds, or None when the header is absent or holds a
+        date rather than a number.
+    """
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _masked_fill_value(dtype: np.dtype[Any]) -> float:
+    """Return the value that marks a masked pixel for a pixel type.
+
+    An integer raster keeps its mask through the COG conversion, so a masked
+    integer pixel holds 0 and the internal mask says it is invalid. A float
+    raster does not. rio-cogeo wraps the source in a WarpedVRT with an alpha
+    band, and GDAL builds a float alpha band for a float source. It reads that
+    band as data rather than as a mask, so every pixel comes out valid and a
+    masked pixel reads as a real 0. The fix writes nan into a masked float
+    pixel, and the caller declares nan as the nodata value of the raw GeoTIFF
+    (pull request #871 review).
+
+    Args:
+        dtype: Pixel type of the decoded cache tile.
+
+    Returns:
+        nan for a float pixel type, and 0 for any other.
+    """
+    return float("nan") if np.issubdtype(dtype, np.floating) else 0.0
 
 
 def _write_mosaic(
@@ -782,17 +881,19 @@ def _write_mosaic(
     height, width = tile.height_px, tile.width_px
     mask = np.zeros((height, width), dtype=bool)
     data: NDArray[Any] | None = None
+    fill: float = 0.0
 
     for ref, content in tiles:
         patch, patch_mask = decode_tile_bytes(content, cache.tile_format)
         if data is None:
-            data = np.zeros((patch.shape[0], height, width), dtype=patch.dtype)
+            fill = _masked_fill_value(patch.dtype)
+            data = np.full((patch.shape[0], height, width), fill, dtype=patch.dtype)
         elif patch.shape[0] != data.shape[0]:
             raise TileCacheError(
                 f"The '{cache.tile_format}' cache mixes {data.shape[0]}-band and "
                 f"{patch.shape[0]}-band tiles. Portolan cannot merge them."
             )
-        _place_patch(data, mask, patch, patch_mask, ref)
+        _place_patch(data, mask, patch, patch_mask, ref, fill)
 
     if data is None or not mask.any():
         return False
@@ -807,10 +908,15 @@ def _write_mosaic(
             count=data.shape[0],
             dtype=data.dtype,
             crs=crs,
+            nodata=fill if np.isnan(fill) else None,
             transform=from_origin(tile.bbox[0], tile.bbox[3], lod.resolution, lod.resolution),
         ) as dst:
             dst.write(data)
-            dst.write_mask(mask)
+            if not np.isnan(fill):
+                # A float raster states its validity through the nan nodata
+                # value alone. GDAL ignores a per-dataset mask when the source
+                # also declares a nodata value, and warns about the pair.
+                dst.write_mask(mask)
     except Exception as exc:
         raise TileCacheError(f"Failed to write {output_path}: {exc}") from exc
     return True
@@ -822,6 +928,7 @@ def _place_patch(
     patch: NDArray[Any],
     patch_mask: NDArray[np.bool_],
     ref: CacheTileRef,
+    fill: float,
 ) -> None:
     """Copy one decoded cache tile into the output arrays.
 
@@ -834,6 +941,7 @@ def _place_patch(
         patch: Decoded cache tile, shaped (bands, height, width).
         patch_mask: Validity mask of the cache tile.
         ref: Reference that says where the cache tile lands.
+        fill: Value to write into a masked pixel.
     """
     src_row = max(0, -ref.dst_row)
     src_col = max(0, -ref.dst_col)
@@ -846,5 +954,8 @@ def _place_patch(
 
     values = patch[:, src_row : src_row + rows, src_col : src_col + cols]
     valid = patch_mask[src_row : src_row + rows, src_col : src_col + cols]
-    data[:, dst_row : dst_row + rows, dst_col : dst_col + cols] = np.where(valid, values, 0)
+    # The fill keeps the patch dtype. A bare Python float would promote an
+    # integer patch to float64, and the write would cast it back.
+    blank = np.asarray(fill, dtype=values.dtype)
+    data[:, dst_row : dst_row + rows, dst_col : dst_col + cols] = np.where(valid, values, blank)
     mask[dst_row : dst_row + rows, dst_col : dst_col + cols] = valid

@@ -358,7 +358,36 @@ class TestLicenseOptions:
 
         assert exit_code == 1
         assert report is None
-        assert "No usable license for this extraction" in capsys.readouterr().err
+        captured = capsys.readouterr()
+        assert "No usable license for this extraction" in captured.err
+        # The FeatureServer path prints the same hint (pull request #871 review).
+        assert "Pass --license with an SPDX identifier" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_json_mode_prints_no_license_hint(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """JSON output carries the error envelope, so prose would break it."""
+        from portolan_cli.errors import MissingLicenseError
+
+        mock_extract = AsyncMock(
+            side_effect=MissingLicenseError(
+                "this extraction", "the source publishes no license URL to link to"
+            )
+        )
+
+        with patch(
+            "portolan_cli.extract.arcgis.imageserver.orchestrator.extract_imageserver",
+            mock_extract,
+        ):
+            exit_code, _ = await run_imageserver_extraction(
+                url=SERVICE_URL,
+                output_dir=tmp_path,
+                options=ImageServerCLIOptions(use_json=True),
+            )
+
+        assert exit_code == 1
+        assert "Pass --license" not in capsys.readouterr().out
 
 
 class TestEmptyTileOutcome:

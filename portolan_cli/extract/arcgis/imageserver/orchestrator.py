@@ -29,11 +29,13 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from portolan_cli.errors import MissingLicenseError
 from portolan_cli.extract.arcgis.imageserver.extractor import (
     ExtractionConfig,
     TileProgress,
     extract_imageserver,
 )
+from portolan_cli.licensing import CLI_LICENSE_REMEDIATION
 from portolan_cli.output import detail, error, info, success, warn
 
 if TYPE_CHECKING:
@@ -140,7 +142,8 @@ def _print_failure_hint(tiles_failed: int) -> None:
     """
     warn(
         f"Re-run the same command with --resume to retry the {tiles_failed} failed tiles. "
-        "If the server returned HTTP 5xx, lower --tile-size or --max-concurrent."
+        "If the server returned HTTP 5xx, lower --tile-size or --max-concurrent. "
+        "A new --tile-size builds another tile grid, so that run reads every tile again."
     )
 
 
@@ -164,7 +167,8 @@ async def run_imageserver_extraction(
 
     Returns:
         Tuple of (exit_code, report). Exit code is 0 for success, 1 for failure.
-        Report is None on complete failure.
+        Report is None on complete failure. A run without a usable license
+        also prints the flags that set one.
     """
     if options is None:
         options = ImageServerCLIOptions()
@@ -234,6 +238,15 @@ async def run_imageserver_extraction(
             )
 
         return 0, result.report
+
+    except MissingLicenseError as e:
+        # The license resolves before any download, so the failure costs one
+        # command re-run. The user needs the flags that fix it, which the
+        # FeatureServer path also prints (pull request #871 review).
+        error(f"ImageServer extraction failed: {e}")
+        if not options.use_json:
+            info(CLI_LICENSE_REMEDIATION)
+        return 1, None
 
     except Exception as e:
         error(f"ImageServer extraction failed: {e}")

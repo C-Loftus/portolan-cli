@@ -33,6 +33,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -54,7 +55,9 @@ from portolan_cli.extract.arcgis.imageserver.report import (
 )
 from portolan_cli.extract.arcgis.imageserver.resume import (
     ImageServerResumeState,
+    TileGrid,
     load_resume_state,
+    save_resume_state,
     should_process_tile,
 )
 from portolan_cli.extract.arcgis.imageserver.tilecache import (
@@ -62,13 +65,14 @@ from portolan_cli.extract.arcgis.imageserver.tilecache import (
     LevelOfDetail,
     TileCacheError,
     TileCacheInfo,
+    TileCacheRateLimitError,
     compute_cache_tile_grid,
+    ensure_cache_readable,
     fetch_cache_tile,
     probe_block_empty,
     select_probe_lod,
 )
 from portolan_cli.extract.arcgis.imageserver.tiling import TileSpec, compute_tile_grid
-from portolan_cli.json_io import write_json_atomic
 from portolan_cli.licensing import (
     ResolvedLicense,
     license_url_from_text,
@@ -277,6 +281,14 @@ def _build_export_url(service_url: str, tile: TileSpec) -> str:
 # Longest response body excerpt that a tile error message quotes.
 _ERROR_BODY_EXCERPT_CHARS = 200
 
+# How much of a response body the excerpt reads. An HTML error page carries
+# its title after the doctype, the head, and a style block.
+_ERROR_BODY_SCAN_CHARS = 4000
+
+#: Title of an HTML error page, which names the failure. The rest of the page
+#: is boilerplate.
+_HTML_TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
 
 def _describe_arcgis_error(
     tile: TileSpec,
@@ -352,8 +364,7 @@ def _describe_http_error(
     if arcgis_msg is not None:
         return arcgis_msg
 
-    excerpt = content[:_ERROR_BODY_EXCERPT_CHARS].decode("utf-8", errors="replace").strip()
-    excerpt = " ".join(excerpt.split())
+    excerpt = _body_excerpt(content)
     if not excerpt:
         return (
             f"Tile download failed ({tile.get_id()}): HTTP {status_code} "
@@ -363,6 +374,32 @@ def _describe_http_error(
         f"Tile download failed ({tile.get_id()}): HTTP {status_code}. "
         f"Response: {excerpt}. Request: {export_url}"
     )
+
+
+def _body_excerpt(content: bytes) -> str:
+    """Quote the part of an error body that tells the user something.
+
+    A server error page spends its first 200 characters on a doctype, a head,
+    and a style block. The request URL is the useful part of the message, so
+    an HTML body reports its title alone (pull request #871 review).
+
+    Args:
+        content: Raw response body.
+
+    Returns:
+        The excerpt to quote, which is empty when the body holds nothing
+        useful.
+    """
+    text = content[:_ERROR_BODY_SCAN_CHARS].decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    if text.lstrip().lower().startswith(("<!doctype", "<html")):
+        match = _HTML_TITLE_PATTERN.search(text)
+        if match is None:
+            return "an HTML error page"
+        title = " ".join(match.group(1).split())
+        return f"an HTML error page titled '{title}'" if title else "an HTML error page"
+    return " ".join(text.split())[:_ERROR_BODY_EXCERPT_CHARS]
 
 
 def _describe_non_tiff_body(
@@ -672,20 +709,15 @@ def _save_resume_state(state: ImageServerResumeState, path: Path) -> None:
     That replaces the old shared-``.tmp``-plus-``flock`` dance, which serialized
     writers only after both had already truncated the same temp file.
 
+    The resume module owns the file format, and this wrapper keeps one writer
+    for it. A second copy of the format here dropped the coarse-empty tiles
+    and the tile grid from every saved state (pull request #871 review).
+
     Args:
         state: Resume state to save.
         path: Path to write the JSON file.
     """
-    data = {
-        "extraction_type": "imageserver",
-        "service_url": state.service_url,
-        "started_at": state.started_at.isoformat().replace("+00:00", "Z"),
-        "tiles": {
-            "succeeded": sorted([list(coord) for coord in state.succeeded_tiles]),
-            "failed": sorted([list(coord) for coord in state.failed_tiles]),
-        },
-    }
-    write_json_atomic(path, data)
+    save_resume_state(state, path)
 
 
 def _create_empty_result(output_dir: Path) -> ExtractionResult:
@@ -826,7 +858,8 @@ def _plan_tiles(
 
     Raises:
         ImageServerExtractionError: If the service rejects exportImage and
-            publishes no tile cache, so no path can read it. Also if the
+            publishes no tile cache, so no path can read it. Also if the cache
+            format has no decoder here, or the decoder does not load, or the
             extent cannot be reprojected to the cache CRS.
     """
     if metadata.export_image_supported:
@@ -847,6 +880,11 @@ def _plan_tiles(
             "rejects exportImage. It also publishes no tileInfo block, so Portolan "
             "has no way to read it."
         )
+
+    try:
+        ensure_cache_readable(cache)
+    except TileCacheError as e:
+        raise ImageServerExtractionError(str(e)) from e
 
     extent, pixel_size = _extent_in_cache_crs(metadata, extent, cache)
     lod = cache.select_lod(pixel_size)
@@ -903,6 +941,7 @@ async def _download_one_tile(
         Tuple of the bytes read and whether the tile holds no valid pixel.
 
     Raises:
+        RateLimitError: If the cache answers HTTP 429.
         ImageServerExtractionError: If the read fails.
     """
     if plan.cache is None or plan.lod is None:
@@ -924,6 +963,9 @@ async def _download_one_tile(
             plan.lod,
             plan.cache.crs_string(),
         )
+    except TileCacheRateLimitError as e:
+        # The retry loop backs off on this one, rather than spending an attempt.
+        raise RateLimitError(retry_after=e.retry_after) from e
     except TileCacheError as e:
         raise ImageServerExtractionError(str(e)) from e
     return result.bytes_downloaded, result.empty
@@ -1584,6 +1626,11 @@ def _record_coarse_empty_tiles(
 ) -> None:
     """Record the blocks the coarse scan called empty.
 
+    A coarse verdict reads a lower-resolution level, which can drop a thin
+    feature. It therefore goes to its own set rather than to the succeeded
+    tiles, so --no-coarse-scan reads the block again (pull request #871
+    review).
+
     Args:
         tiles: Blocks the coarse scan skipped.
         stats: Statistics to update.
@@ -1591,7 +1638,7 @@ def _record_coarse_empty_tiles(
     """
     for tile in tiles:
         stats.tiles_empty += 1
-        resume_state.succeeded_tiles.add((tile.x, tile.y))
+        resume_state.coarse_empty_tiles.add((tile.x, tile.y))
         stats.tile_results.append(
             TileResult(
                 tile_id=tile.get_id(),
@@ -1737,17 +1784,27 @@ async def extract_imageserver(
 
     # Resume state
     resume_path = portolan_dir / "imageserver-resume.json"
-    resume_state = _load_or_create_resume_state(resume, resume_path, url)
+    grid = TileGrid(
+        tile_size=config.tile_size,
+        extent=(extent["xmin"], extent["ymin"], extent["xmax"], extent["ymax"]),
+    )
+    resume_state = _load_or_create_resume_state(resume, resume_path, url, grid)
 
     # Split the tiles before the coarse scan. A tile that a previous run
     # completed keeps the "skipped" status. The scan never probes it, and the
     # scan verdict never overwrites its completion.
     # Compute skipped tiles BEFORE extraction (resume_state changes during extraction)
-    pending_tiles = [t for t in tiles if should_process_tile(t.x, t.y, resume_state)]
-    skipped_tile_specs = [t for t in tiles if not should_process_tile(t.x, t.y, resume_state)]
+    pending_tiles, skipped_tile_specs, known_empty_tiles = _split_tiles_for_resume(
+        tiles, resume_state, config
+    )
     tiles_skipped = len(skipped_tile_specs)
     if tiles_skipped > 0:
         info(f"Skipping {tiles_skipped} already-completed tiles")
+    if known_empty_tiles:
+        info(
+            f"Skipping {len(known_empty_tiles)} blocks that an earlier coarse scan "
+            "called empty. Pass --no-coarse-scan to read them again."
+        )
 
     # Ask a coarse cache level which blocks hold data, before reading any of
     # them at full resolution (issue #870).
@@ -1767,7 +1824,7 @@ async def extract_imageserver(
         collection_name=collection_name,
         plan=plan,
     )
-    _record_coarse_empty_tiles(coarse_empty, stats, resume_state)
+    _record_coarse_empty_tiles(coarse_empty + known_empty_tiles, stats, resume_state)
     _save_resume_state(resume_state, resume_path)
 
     # Add skipped tiles to results (computed BEFORE extraction)
@@ -1826,25 +1883,86 @@ async def extract_imageserver(
     )
 
 
+def _split_tiles_for_resume(
+    tiles: list[TileSpec],
+    resume_state: ImageServerResumeState,
+    config: ExtractionConfig,
+) -> tuple[list[TileSpec], list[TileSpec], list[TileSpec]]:
+    """Sort the planned tiles into the three groups a resumed run needs.
+
+    Args:
+        tiles: Every planned tile.
+        resume_state: Resume state of the run.
+        config: Extraction configuration, which says whether the scan runs.
+
+    Returns:
+        Tuple of the tiles to read, the tiles a previous run completed, and
+        the blocks a previous coarse scan called empty.
+    """
+    pending: list[TileSpec] = []
+    skipped: list[TileSpec] = []
+    known_empty: list[TileSpec] = []
+    for tile in tiles:
+        if should_process_tile(tile.x, tile.y, resume_state, coarse_scan=config.coarse_scan):
+            pending.append(tile)
+        elif (tile.x, tile.y) in resume_state.succeeded_tiles:
+            skipped.append(tile)
+        else:
+            known_empty.append(tile)
+    return pending, skipped, known_empty
+
+
+def _grid_change_reason(saved: TileGrid, current: TileGrid) -> str:
+    """Say what changed between the saved tile grid and this one.
+
+    Args:
+        saved: Grid the saved state describes.
+        current: Grid this run extracts.
+
+    Returns:
+        One sentence that names the change.
+    """
+    if saved.tile_size != current.tile_size:
+        return (
+            f"The saved run used --tile-size {saved.tile_size}, and this run uses "
+            f"--tile-size {current.tile_size}."
+        )
+    return "The saved run covered another area than this run does."
+
+
 def _load_or_create_resume_state(
     resume: bool,
     resume_path: Path,
     url: str,
+    grid: TileGrid,
 ) -> ImageServerResumeState:
     """Load existing resume state or create new one.
+
+    A tile id names a position in one tile grid. A run with another tile size,
+    or over another extent, builds a different grid, so a saved tile id then
+    names a different area. Such a state cannot resume, and this starts a
+    fresh one instead (pull request #871 review).
 
     Args:
         resume: Whether to attempt loading existing state.
         resume_path: Path to resume state file.
         url: Service URL for new state.
+        grid: Tile grid this run extracts.
 
     Returns:
         Resume state (loaded or new).
     """
     if resume:
         state = load_resume_state(resume_path)
+        if state and state.grid is not None and not state.grid.matches(grid):
+            warn(
+                f"{_grid_change_reason(state.grid, grid)} The tile grids differ, so "
+                "this run reads every tile again."
+            )
+            state = None
         if state:
             info(f"Resuming: {len(state.succeeded_tiles)} tiles already complete")
+            state.grid = grid
             return state
 
     return ImageServerResumeState(
@@ -1852,4 +1970,5 @@ def _load_or_create_resume_state(
         failed_tiles=set(),
         service_url=url,
         started_at=datetime.now(timezone.utc),
+        grid=grid,
     )

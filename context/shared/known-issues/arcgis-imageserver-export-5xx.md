@@ -43,6 +43,12 @@ A smaller `--tile-size` produces more tiles, and each one costs the server
 less. Lower `--max-concurrent` stops parallel requests from competing for the
 same server resources.
 
+A new `--tile-size` builds a different tile grid. A tile id then names a
+different area on the ground, so the saved state cannot match it. Since
+September 2026 the run reports the change and reads every tile again. Keep
+`--tile-size` and lower `--max-concurrent` alone when you want the resume to
+skip the tiles that already succeeded.
+
 ## References
 
 - Issue #870, "Unable to extract data from an ESRI Image Service"
@@ -52,4 +58,5 @@ same server resources.
 ## Regression test
 
 - `tests/unit/extract/arcgis/imageserver/test_extractor.py::TestHttpErrorMessages`
+- `tests/unit/extract/arcgis/imageserver/test_extractor.py::TestResumeGridGuard`
 - `tests/unit/extract/arcgis/imageserver/test_orchestrator.py::TestRetriesAndFailureHint`
